@@ -4,6 +4,7 @@ import json
 import os
 import re
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import unquote, urlparse
@@ -46,18 +47,37 @@ def extract_marked_up_text(contents: Any) -> list[str]:
     return []
 
 
-def guess_symbol_name(path: str | None, line: int, column: int) -> Optional[str]:
-    if not path or not os.path.exists(path):
-        return None
+@lru_cache(maxsize=1024)
+def _cached_file_lines(path: str, mtime_ns: int, size: int) -> tuple[str, ...]:
+    del mtime_ns, size
     try:
-        line_text = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()[line]
+        return tuple(Path(path).read_text(encoding="utf-8", errors="replace").splitlines())
     except Exception:
+        return ()
+
+
+@lru_cache(maxsize=4096)
+def _cached_symbol_name(path: str, line: int, column: int, mtime_ns: int, size: int) -> Optional[str]:
+    if line < 0 or column < 0:
+        return None
+    lines = _cached_file_lines(path, mtime_ns, size)
+    if line >= len(lines):
         return None
 
-    for match in _IDENT_RE.finditer(line_text):
+    for match in _IDENT_RE.finditer(lines[line]):
         if match.start() <= column < match.end():
             return match.group(0)
     return None
+
+
+def guess_symbol_name(path: str | None, line: int, column: int) -> Optional[str]:
+    if not path:
+        return None
+    try:
+        stat_result = os.stat(path)
+    except OSError:
+        return None
+    return _cached_symbol_name(path, line, column, stat_result.st_mtime_ns, stat_result.st_size)
 
 
 def module_name_from_path(path: str | None) -> str | None:
@@ -256,6 +276,7 @@ class LspProjectResolverBackend(ProjectResolverBackend):
             initialization_options=initialization_options,
         )
         self._opened_documents: set[str] = set()
+        self._resolved_target_cache: dict[tuple[str, int, int], ResolvedTarget] = {}
 
     @staticmethod
     def to_lsp_line(line: int) -> int:
@@ -287,6 +308,10 @@ class LspProjectResolverBackend(ProjectResolverBackend):
         line = int(start.get("line", 0))
         column = int(start.get("character", 0))
         path = uri_to_path(uri)
+        cache_key = (path or uri or "", line, column)
+        cached = self._resolved_target_cache.get(cache_key)
+        if cached is not None:
+            return cached
         name = guess_symbol_name(path, line, column)
         if not name and line == 0 and column == 0:
             name = module_name_from_path(path)
@@ -294,7 +319,7 @@ class LspProjectResolverBackend(ProjectResolverBackend):
             module_name = module_name_from_path(path)
             if module_name:
                 name = module_name
-        return ResolvedTarget(
+        target = ResolvedTarget(
             path=path,
             line=line,
             column=column,
@@ -303,6 +328,8 @@ class LspProjectResolverBackend(ProjectResolverBackend):
             kind=None,
             documentation=[],
         )
+        self._resolved_target_cache[cache_key] = target
+        return target
 
     def targets_from_locations(self, result: Any) -> list[ResolvedTarget]:
         if result is None:

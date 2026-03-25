@@ -1,5 +1,6 @@
 """Basic tests for the Python extractor prototype."""
 
+import ast
 import json
 import os
 import shutil
@@ -12,9 +13,26 @@ import pytest
 # Add package to path when running tests without install
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import cf_extractor.main as extractor_main
+import cf_extractor.resolvers.lsp_common as lsp_common
 from cf_extractor.main import find_python_files, run_extract, run_extract_with_metrics
-from cf_extractor.resolvers.lsp_common import guess_symbol_name, module_name_from_path
-from cf_extractor.schema import ReferenceRole, SemanticData, SymbolKind
+from cf_extractor.reference_collector import ReferenceCollector
+from cf_extractor.reference_index import DefinitionIndex, add_parents
+from cf_extractor.resolvers.lsp_common import (
+    LspProjectResolverBackend,
+    guess_symbol_name,
+    module_name_from_path,
+)
+from cf_extractor.schema import (
+    FunctionDetails,
+    ReferenceRole,
+    SemanticData,
+    SourceLocation,
+    SourceSpan,
+    SymbolDefinition,
+    SymbolKind,
+    )
+from cf_extractor.schema import TypeDetails
 
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -30,6 +48,61 @@ def test_guess_symbol_name_requires_cursor_inside_identifier(tmp_path: Path):
     file_path = tmp_path / "sample.pyi"
     file_path.write_text("# This is a comment\nvalue = 1\n", encoding="utf-8")
     assert guess_symbol_name(str(file_path), 0, 0) is None
+
+
+def test_guess_symbol_name_reuses_cached_file_contents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    lsp_common._cached_file_lines.cache_clear()
+    lsp_common._cached_symbol_name.cache_clear()
+
+    file_path = tmp_path / "sample.pyi"
+    file_path.write_text("value = 1\n", encoding="utf-8")
+
+    original_read_text = Path.read_text
+    read_calls = 0
+
+    def counting_read_text(self: Path, *args, **kwargs):
+        nonlocal read_calls
+        if self == file_path:
+            read_calls += 1
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counting_read_text)
+
+    assert guess_symbol_name(str(file_path), 0, 1) == "value"
+    assert guess_symbol_name(str(file_path), 0, 1) == "value"
+    assert read_calls == 1
+
+
+def test_location_to_target_reuses_cached_resolved_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    lsp_common._cached_file_lines.cache_clear()
+    lsp_common._cached_symbol_name.cache_clear()
+
+    file_path = tmp_path / "sample.py"
+    file_path.write_text("value = 1\n", encoding="utf-8")
+
+    backend = object.__new__(LspProjectResolverBackend)
+    backend._resolved_target_cache = {}
+
+    original_guess_symbol_name = lsp_common.guess_symbol_name
+    guess_calls = 0
+
+    def counting_guess_symbol_name(path: str | None, line: int, column: int):
+        nonlocal guess_calls
+        guess_calls += 1
+        return original_guess_symbol_name(path, line, column)
+
+    monkeypatch.setattr(lsp_common, "guess_symbol_name", counting_guess_symbol_name)
+
+    location = {
+        "uri": lsp_common.path_to_uri(str(file_path)),
+        "range": {"start": {"line": 0, "character": 1}},
+    }
+    first = backend.location_to_target(location)
+    second = backend.location_to_target(location)
+
+    assert first is second
+    assert first.name == "value"
+    assert guess_calls == 1
 
 
 def test_module_name_from_typeshed_path_uses_module_not_first_word():
@@ -76,6 +149,239 @@ def test_run_extract_with_metrics_reports_counts():
     assert metrics.reference_count >= 1
     assert metrics.resolved_reference_count >= 1
     assert metrics.total_seconds >= 0
+
+
+def test_run_extract_with_metrics_builds_definition_index_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    (tmp_path / "a.py").write_text(
+        """
+def a():
+    return 1
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "b.py").write_text(
+        """
+from a import a
+
+
+def b():
+    return a()
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    class DummyBackend:
+        def open_document(self, file_path: str, source: str) -> object:
+            return object()
+
+        def close(self) -> None:
+            return None
+
+    build_calls = 0
+    original_build = extractor_main.DefinitionIndex.build.__func__
+
+    def counting_build(cls, definitions):
+        nonlocal build_calls
+        build_calls += 1
+        return original_build(cls, definitions)
+
+    monkeypatch.setattr(extractor_main.DefinitionIndex, "build", classmethod(counting_build))
+    monkeypatch.setattr(extractor_main, "build_project_resolver_backend", lambda *args, **kwargs: DummyBackend())
+    monkeypatch.setattr(extractor_main, "collect_references", lambda *args, **kwargs: ([], []))
+
+    run_extract_with_metrics(str(tmp_path))
+
+    assert build_calls == 1
+
+
+def test_verbose_reference_warning_prints_traceback_and_timing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    (tmp_path / "sample.py").write_text(
+        """
+def sample():
+    return 1
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    class DummyBackend:
+        def open_document(self, file_path: str, source: str) -> object:
+            return object()
+
+        def close(self) -> None:
+            return None
+
+    def boom(*args, **kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(extractor_main, "build_project_resolver_backend", lambda *args, **kwargs: DummyBackend())
+    monkeypatch.setattr(extractor_main, "collect_references", boom)
+
+    run_extract_with_metrics(str(tmp_path), verbose=True)
+    captured = capsys.readouterr()
+
+    assert "Warning: references sample.py: maximum recursion depth exceeded" in captured.err
+    assert "Traceback (most recent call last):" in captured.err
+    assert "[2/2] References failed (1/1): sample.py" in captured.err
+    assert "open_document=" in captured.err
+    assert "collect_references=" in captured.err
+
+
+def test_narrow_by_import_reuses_cached_import_bindings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    file_path = tmp_path / "sample.py"
+    source = "from pkg.ops import CreateModel\nCreateModel()\nCreateModel()\n"
+    file_path.write_text(source, encoding="utf-8")
+
+    class DummyResolver:
+        def goto(self, line: int, column: int, *, follow_imports: bool = False):
+            return []
+
+        def references(self, line: int, column: int):
+            return []
+
+        def document_symbols(self):
+            return []
+
+        def workspace_symbols(self, query: str):
+            return []
+
+        def hover(self, line: int, column: int):
+            return []
+
+    candidates = [
+        SymbolDefinition(
+            symbol_id="pkg.ops.models.CreateModel",
+            kind=SymbolKind.Function,
+            name="CreateModel",
+            display_name="CreateModel",
+            location=SourceLocation(file_path="pkg/ops/models.py", line=0, column=0),
+            span=SourceSpan(start_line=0, start_column=0, end_line=1, end_column=0),
+            details=FunctionDetails(),
+        ),
+        SymbolDefinition(
+            symbol_id="other.models.CreateModel",
+            kind=SymbolKind.Function,
+            name="CreateModel",
+            display_name="CreateModel",
+            location=SourceLocation(file_path="other/models.py", line=0, column=0),
+            span=SourceSpan(start_line=0, start_column=0, end_line=1, end_column=0),
+            details=FunctionDetails(),
+        ),
+    ]
+    collector = ReferenceCollector(
+        file_path=str(file_path),
+        source=source,
+        project_root=str(tmp_path),
+        all_definitions=candidates,
+        definition_index=DefinitionIndex.build(candidates),
+        module_symbol_id="sample",
+        resolver=DummyResolver(),
+    )
+    collector.tree = ast.parse(source, filename=str(file_path))
+
+    original_sorted_import_nodes = collector._sorted_import_nodes
+    sorted_import_nodes_calls = 0
+
+    def counting_sorted_import_nodes():
+        nonlocal sorted_import_nodes_calls
+        sorted_import_nodes_calls += 1
+        return original_sorted_import_nodes()
+
+    monkeypatch.setattr(collector, "_sorted_import_nodes", counting_sorted_import_nodes)
+
+    assert collector._narrow_by_import("CreateModel", candidates) == "pkg.ops.models.CreateModel"
+    assert collector._narrow_by_import("CreateModel", candidates) == "pkg.ops.models.CreateModel"
+    assert sorted_import_nodes_calls == 1
+
+
+def test_infer_local_name_type_reuses_function_assignment_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    file_path = tmp_path / "sample.py"
+    source = """
+class Builder:
+    pass
+
+
+def sample():
+    value: Builder = builder()
+    first = value
+    second = value
+""".strip() + "\n"
+    file_path.write_text(source, encoding="utf-8")
+
+    class DummyResolver:
+        def goto(self, line: int, column: int, *, follow_imports: bool = False):
+            return []
+
+        def references(self, line: int, column: int):
+            return []
+
+        def document_symbols(self):
+            return []
+
+        def workspace_symbols(self, query: str):
+            return []
+
+        def hover(self, line: int, column: int):
+            return []
+
+    builder_definition = SymbolDefinition(
+        symbol_id="sample.builder",
+        kind=SymbolKind.Function,
+        name="builder",
+        display_name="builder",
+        location=SourceLocation(file_path="sample.py", line=3, column=0),
+        span=SourceSpan(start_line=3, start_column=0, end_line=4, end_column=0),
+        details=FunctionDetails(return_types=["sample.Builder"]),
+    )
+    builder_type_definition = SymbolDefinition(
+        symbol_id="sample.Builder",
+        kind=SymbolKind.Type,
+        name="Builder",
+        display_name="Builder",
+        location=SourceLocation(file_path="sample.py", line=0, column=0),
+        span=SourceSpan(start_line=0, start_column=0, end_line=2, end_column=0),
+        details=TypeDetails(),
+    )
+    definitions = [builder_definition, builder_type_definition]
+    collector = ReferenceCollector(
+        file_path=str(file_path),
+        source=source,
+        project_root=str(tmp_path),
+        all_definitions=definitions,
+        definition_index=DefinitionIndex.build(definitions),
+        module_symbol_id="sample",
+        resolver=DummyResolver(),
+    )
+    collector.tree = ast.parse(source, filename=str(file_path))
+    add_parents(collector.tree)
+    func_node = next(node for node in ast.walk(collector.tree) if isinstance(node, ast.FunctionDef))
+    name_nodes = [node for node in ast.walk(func_node) if isinstance(node, ast.Name) and node.id == "value" and isinstance(node.ctx, ast.Load)]
+
+    original_ast_walk = ast.walk
+    ast_walk_calls = 0
+
+    def counting_ast_walk(node):
+        nonlocal ast_walk_calls
+        if node is func_node:
+            ast_walk_calls += 1
+        return original_ast_walk(node)
+
+    monkeypatch.setattr(ast, "walk", counting_ast_walk)
+    monkeypatch.setattr(
+        collector,
+        "_normalize_type_ref",
+        lambda type_ref, *, line, column: "sample.Builder" if type_ref == "Builder" else None,
+    )
+
+    assert collector._infer_local_name_type("value", name_nodes[0], "sample.sample") == "sample.Builder"
+    assert collector._infer_local_name_type("value", name_nodes[1], "sample.sample") == "sample.Builder"
+    assert ast_walk_calls == 1
 
 
 def test_fixtures_have_definitions():
@@ -364,6 +670,35 @@ def render(name: str) -> str:
     ]
 
     assert not any(reference.method_name == "format" and reference.target_symbol is None for reference in refs)
+
+
+def test_self_referential_attribute_update_does_not_recurse(tmp_path: Path):
+    (tmp_path / "sample.py").write_text(
+        """
+class Box:
+    value: str
+
+    def normalize(self):
+        self.value = self.value.strip()
+        return self.value
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    data = run_extract(str(tmp_path))
+    refs = [
+        reference
+        for doc in data.documents
+        for reference in doc.references
+        if reference.enclosing_symbol == "sample.Box.normalize"
+    ]
+
+    assert any(
+        reference.role == ReferenceRole.Write
+        and reference.target_symbol == "sample.Box.value"
+        for reference in refs
+    )
 
 
 def test_path_method_on_binary_expression_uses_return_type_and_operator(tmp_path: Path):

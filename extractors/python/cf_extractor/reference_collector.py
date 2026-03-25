@@ -66,6 +66,14 @@ class _ImportBinding:
     column: int
 
 
+@dataclass(frozen=True, slots=True)
+class _LocalAssignment:
+    line: int
+    column: int
+    annotation: ast.AST | None = None
+    value: ast.AST | None = None
+
+
 class ReferenceCollector(ast.NodeVisitor):
     """Collects references and uses the injected resolver to resolve targets."""
 
@@ -94,9 +102,13 @@ class ReferenceCollector(ast.NodeVisitor):
         self._enclosing_defined_cache: dict[str, Optional[str]] = {}
         self._class_prefix_cache: dict[str, Optional[str]] = {}
         self._import_bindings: list[_ImportBinding] | None = None
+        self._import_bindings_by_name: dict[str, list[_ImportBinding]] | None = None
+        self._narrow_by_import_cache: dict[tuple[str, tuple[str, ...]], Optional[str]] = {}
         self._local_type_cache: dict[tuple[str, str, int, int], Optional[str]] = {}
         self._local_type_in_progress: set[tuple[str, str, int, int]] = set()
+        self._function_local_assignments: dict[int, dict[str, list[_LocalAssignment]]] = {}
         self._variable_value_type_cache: dict[str, Optional[str]] = {}
+        self._variable_value_type_in_progress: set[str] = set()
         self._internal_roots = {
             definition.symbol_id.split(".", 1)[0]
             for definition in all_definitions
@@ -662,7 +674,11 @@ class ReferenceCollector(ast.NodeVisitor):
                     )
                 )
 
+        bindings_by_name: dict[str, list[_ImportBinding]] = {}
+        for binding in bindings:
+            bindings_by_name.setdefault(binding.imported_as, []).append(binding)
         self._import_bindings = bindings
+        self._import_bindings_by_name = bindings_by_name
         return bindings
 
     def _binding_for_name(self, name: str, *, line: int, column: int) -> Optional[_ImportBinding]:
@@ -908,23 +924,29 @@ class ReferenceCollector(ast.NodeVisitor):
         cached = self._variable_value_type_cache.get(definition.symbol_id)
         if definition.symbol_id in self._variable_value_type_cache:
             return cached
-
-        value_expr = self._value_expr_for_variable_definition(definition)
-        if value_expr is None:
-            self._variable_value_type_cache[definition.symbol_id] = None
+        if definition.symbol_id in self._variable_value_type_in_progress:
             return None
 
-        enclosing_symbol = (
-            self._ast_enclosing_defined_symbol(value_expr)
-            or definition.enclosing_symbol
-            or self.module_symbol_id
-        )
-        inferred_type = self._infer_expr_value_type(
-            value_expr,
-            enclosing_symbol,
-        )
-        self._variable_value_type_cache[definition.symbol_id] = inferred_type
-        return inferred_type
+        self._variable_value_type_in_progress.add(definition.symbol_id)
+        try:
+            value_expr = self._value_expr_for_variable_definition(definition)
+            if value_expr is None:
+                self._variable_value_type_cache[definition.symbol_id] = None
+                return None
+
+            enclosing_symbol = (
+                self._ast_enclosing_defined_symbol(value_expr)
+                or definition.enclosing_symbol
+                or self.module_symbol_id
+            )
+            inferred_type = self._infer_expr_value_type(
+                value_expr,
+                enclosing_symbol,
+            )
+            self._variable_value_type_cache[definition.symbol_id] = inferred_type
+            return inferred_type
+        finally:
+            self._variable_value_type_in_progress.discard(definition.symbol_id)
 
     def _builtin_receiver_type_from_constant(self, value: object) -> Optional[str]:
         if isinstance(value, bool):
@@ -1062,26 +1084,19 @@ class ReferenceCollector(ast.NodeVisitor):
         best: Optional[str] = None
         try:
             current_pos = (node.lineno - 1, getattr(node, "col_offset", 0) or 0)
-            for candidate in ast.walk(func_node):
-                if candidate is node:
+            assignments = self._local_assignments_for_function(func_node).get(name, [])
+            for assignment in reversed(assignments):
+                assignment_pos = (assignment.line, assignment.column)
+                if assignment_pos >= current_pos:
                     continue
-                candidate_pos = (getattr(candidate, "lineno", 0) - 1, getattr(candidate, "col_offset", 0) or 0)
-                if candidate_pos >= current_pos:
-                    continue
-                if (
-                    isinstance(candidate, ast.AnnAssign)
-                    and isinstance(candidate.target, ast.Name)
-                    and candidate.target.id == name
-                ):
+                if assignment.annotation is not None:
                     best = self._normalize_type_ref(
-                        ast.unparse(candidate.annotation),
-                        line=candidate.lineno - 1,
-                        column=getattr(candidate, "col_offset", 0) or 0,
+                        ast.unparse(assignment.annotation),
+                        line=assignment.line,
+                        column=assignment.column,
                     )
-                elif isinstance(candidate, ast.Assign):
-                    if not any(isinstance(target, ast.Name) and target.id == name for target in candidate.targets):
-                        continue
-                    best = self._infer_receiver_type_symbol(candidate.value, enclosing_symbol)
+                elif assignment.value is not None:
+                    best = self._infer_receiver_type_symbol(assignment.value, enclosing_symbol)
                 if best:
                     break
         finally:
@@ -1089,6 +1104,42 @@ class ReferenceCollector(ast.NodeVisitor):
 
         self._local_type_cache[cache_key] = best
         return best
+
+    def _local_assignments_for_function(
+        self,
+        func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> dict[str, list[_LocalAssignment]]:
+        cache_key = id(func_node)
+        cached = self._function_local_assignments.get(cache_key)
+        if cached is not None:
+            return cached
+
+        assignments: dict[str, list[_LocalAssignment]] = {}
+        for candidate in ast.walk(func_node):
+            if isinstance(candidate, ast.AnnAssign) and isinstance(candidate.target, ast.Name):
+                assignments.setdefault(candidate.target.id, []).append(
+                    _LocalAssignment(
+                        line=candidate.lineno - 1,
+                        column=getattr(candidate, "col_offset", 0) or 0,
+                        annotation=candidate.annotation,
+                    )
+                )
+            elif isinstance(candidate, ast.Assign):
+                for target in candidate.targets:
+                    if isinstance(target, ast.Name):
+                        assignments.setdefault(target.id, []).append(
+                            _LocalAssignment(
+                                line=candidate.lineno - 1,
+                                column=getattr(candidate, "col_offset", 0) or 0,
+                                value=candidate.value,
+                            )
+                        )
+
+        for entries in assignments.values():
+            entries.sort(key=lambda assignment: (assignment.line, assignment.column))
+
+        self._function_local_assignments[cache_key] = assignments
+        return assignments
 
     def _hover_type_candidates(self, node: ast.AST) -> list[str]:
         candidates: list[str] = []
@@ -1365,28 +1416,28 @@ class ReferenceCollector(ast.NodeVisitor):
     def _narrow_by_import(self, name: str, candidates: list[SymbolDefinition]) -> Optional[str]:
         if self.tree is None:
             return None
-        for imp_node in ast.walk(self.tree):
-            if not isinstance(imp_node, ast.ImportFrom):
+        cache_key = (name, tuple(candidate.symbol_id for candidate in candidates))
+        if cache_key in self._narrow_by_import_cache:
+            return self._narrow_by_import_cache[cache_key]
+
+        self._all_import_bindings()
+        for binding in (self._import_bindings_by_name or {}).get(name, []):
+            if "." not in binding.qualified_name:
                 continue
-            for alias in imp_node.names:
-                imported_as = alias.asname or alias.name
-                if imported_as != name:
-                    continue
-                prefix = self._resolve_import_module_prefix(imp_node)
-                if not prefix:
-                    continue
-                original_name = alias.name
-                matched = [
-                    candidate
-                    for candidate in candidates
-                    if candidate.name == original_name
-                    and (
-                        candidate.symbol_id.startswith(prefix + ".")
-                        or candidate.symbol_id == prefix
-                    )
-                ]
-                if len(matched) == 1:
-                    return matched[0].symbol_id
+            prefix, _, original_name = binding.qualified_name.rpartition(".")
+            matched = [
+                candidate
+                for candidate in candidates
+                if candidate.name == original_name
+                and (
+                    candidate.symbol_id.startswith(prefix + ".")
+                    or candidate.symbol_id == prefix
+                )
+            ]
+            if len(matched) == 1:
+                self._narrow_by_import_cache[cache_key] = matched[0].symbol_id
+                return matched[0].symbol_id
+        self._narrow_by_import_cache[cache_key] = None
         return None
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -1876,6 +1927,7 @@ def collect_references(
     all_definitions: list[SymbolDefinition],
     module_symbol_id: str,
     resolver: DocumentResolver,
+    definition_index: DefinitionIndex | None = None,
 ) -> tuple[list[SymbolReference], list[SymbolDefinition]]:
     """Run reference collection with the provided resolver on a single document."""
     abs_path = os.path.join(project_root, doc.relative_path)
@@ -1884,7 +1936,7 @@ def collect_references(
         source=source,
         project_root=project_root,
         all_definitions=all_definitions,
-        definition_index=DefinitionIndex.build(all_definitions),
+        definition_index=definition_index or DefinitionIndex.build(all_definitions),
         module_symbol_id=module_symbol_id,
         resolver=resolver,
     )

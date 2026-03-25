@@ -11,12 +11,14 @@ import os
 import resource
 import sys
 import time
+import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from .extractor import extract_definitions_from_file
 from .reference_collector import collect_references
+from .reference_index import DefinitionIndex
 from .resolver_backend import DEFAULT_RESOLVER_BACKEND, RESOLVER_BACKENDS, build_project_resolver_backend
 from .schema import DocumentSemantics, SemanticData, SymbolDefinition
 
@@ -48,6 +50,17 @@ def _peak_rss_kb() -> int:
     if sys.platform == "darwin":
         return int(peak / 1024)
     return int(peak)
+
+
+def _print_verbose(enabled: bool, message: str) -> None:
+    if enabled:
+        print(message, file=sys.stderr)
+
+
+def _print_warning(message: str, *, verbose: bool) -> None:
+    print(message, file=sys.stderr)
+    if verbose:
+        traceback.print_exc(file=sys.stderr)
 
 
 def _is_skipped_path(rel_path: str) -> bool:
@@ -100,6 +113,7 @@ def run_extract_with_metrics(
     resolver_backend: str = DEFAULT_RESOLVER_BACKEND,
     ty_path: str | None = None,
     pyrefly_path: str | None = None,
+    verbose: bool = False,
 ) -> tuple[SemanticData, ExtractionMetrics]:
     project_root = os.path.abspath(project_root)
     metrics = ExtractionMetrics(resolver_backend=resolver_backend)
@@ -125,7 +139,7 @@ def run_extract_with_metrics(
         try:
             source = Path(abs_path).read_text(encoding="utf-8", errors="replace")
         except Exception as exc:
-            print(f"Warning: skip {rel_path}: {exc}", file=sys.stderr)
+            _print_warning(f"Warning: skip {rel_path}: {exc}", verbose=verbose)
             continue
         sources[rel_path] = source
         try:
@@ -133,10 +147,11 @@ def run_extract_with_metrics(
             docs.append(doc)
             all_definitions.extend(doc.definitions)
         except Exception as exc:
-            print(f"Warning: extract defs {rel_path}: {exc}", file=sys.stderr)
+            _print_warning(f"Warning: extract defs {rel_path}: {exc}", verbose=verbose)
             docs.append(DocumentSemantics(relative_path=rel_path, language="python", definitions=[], references=[]))
     metrics.definition_phase_seconds = time.perf_counter() - def_start
     metrics.definition_count = len(all_definitions)
+    definition_index = DefinitionIndex.build(all_definitions)
 
     ref_start = time.perf_counter()
     backend = build_project_resolver_backend(
@@ -158,8 +173,13 @@ def run_extract_with_metrics(
                     source = Path(abs_path).read_text(encoding="utf-8", errors="replace")
                 except Exception:
                     continue
+            open_seconds = 0.0
+            collect_start: float | None = None
             try:
+                open_start = time.perf_counter()
                 resolver = backend.open_document(abs_path, source)
+                open_seconds = time.perf_counter() - open_start
+                collect_start = time.perf_counter()
                 refs, ext_syms = collect_references(
                     doc,
                     abs_path,
@@ -168,7 +188,9 @@ def run_extract_with_metrics(
                     all_definitions,
                     module_symbol_id=Path(rel_path).with_suffix("").as_posix().replace("/", ".") or "__main__",
                     resolver=resolver,
+                    definition_index=definition_index,
                 )
+                collect_seconds = time.perf_counter() - collect_start
                 for ext in ext_syms:
                     external_symbols[ext.symbol_id] = ext
                 docs[i] = DocumentSemantics(
@@ -177,8 +199,26 @@ def run_extract_with_metrics(
                     definitions=doc.definitions,
                     references=refs,
                 )
+                _print_verbose(
+                    verbose,
+                    (
+                        f"[2/2] References done ({i + 1}/{total_ref}): {rel_path} "
+                        f"open_document={open_seconds:.3f}s "
+                        f"collect_references={collect_seconds:.3f}s "
+                        f"refs={len(refs)} ext={len(ext_syms)}"
+                    ),
+                )
             except Exception as exc:
-                print(f"Warning: references {rel_path}: {exc}", file=sys.stderr)
+                failure_collect_seconds = time.perf_counter() - collect_start if collect_start is not None else 0.0
+                _print_verbose(
+                    verbose,
+                    (
+                        f"[2/2] References failed ({i + 1}/{total_ref}): {rel_path} "
+                        f"open_document={open_seconds:.3f}s "
+                        f"collect_references={failure_collect_seconds:.3f}s"
+                    ),
+                )
+                _print_warning(f"Warning: references {rel_path}: {exc}", verbose=verbose)
     finally:
         backend.close()
     metrics.reference_phase_seconds = time.perf_counter() - ref_start
@@ -213,6 +253,7 @@ def run_extract(
     resolver_backend: str = DEFAULT_RESOLVER_BACKEND,
     ty_path: str | None = None,
     pyrefly_path: str | None = None,
+    verbose: bool = False,
 ) -> SemanticData:
     data, _ = run_extract_with_metrics(
         project_root,
@@ -223,6 +264,7 @@ def run_extract(
         resolver_backend=resolver_backend,
         ty_path=ty_path,
         pyrefly_path=pyrefly_path,
+        verbose=verbose,
     )
     return data
 
@@ -269,6 +311,12 @@ def main() -> None:
         "--metrics-out",
         help="Optional path to write extraction metrics as JSON.",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print per-file reference timings and full tracebacks for extraction warnings.",
+    )
 
     args = parser.parse_args()
     project_root = os.path.abspath(args.project_root or ".")
@@ -289,6 +337,7 @@ def main() -> None:
         resolver_backend=args.resolver_backend,
         ty_path=args.ty_path,
         pyrefly_path=args.pyrefly_path,
+        verbose=args.verbose,
     )
     if args.metrics_out:
         Path(args.metrics_out).write_text(
