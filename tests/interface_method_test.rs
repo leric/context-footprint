@@ -100,6 +100,8 @@ fn test_interface_method_becomes_node_with_flag() {
                         }],
                         return_types: vec!["dict#".to_string()],
                         type_params: vec![],
+                        surface_spans: vec![],
+                        implementation_spans: vec![],
                         modifiers: FunctionModifiers {
                             is_async: false,
                             is_generator: false,
@@ -148,8 +150,8 @@ fn test_interface_method_becomes_node_with_flag() {
                 "Method should have complete signature"
             );
             assert_eq!(f.core.doc_score, 0.8, "Should use mock doc score");
-            // Context size should be the mock size
-            assert_eq!(f.core.context_size, 10, "Should use mock context size");
+            // Surface charges the mock-sized signature and documentation fragments.
+            assert_eq!(f.core.context_size, 20, "Should use surface fragment sizes");
         }
         _ => panic!("Method should be a FunctionNode"),
     }
@@ -228,6 +230,8 @@ fn test_interface_method_with_good_doc_is_boundary() {
                         }],
                         return_types: vec!["bool#".to_string()],
                         type_params: vec![],
+                        surface_spans: vec![],
+                        implementation_spans: vec![],
                         modifiers: FunctionModifiers {
                             is_async: false,
                             is_generator: false,
@@ -343,6 +347,8 @@ fn test_call_to_interface_method_creates_edge() {
                         }],
                         return_types: vec!["bool#".to_string()],
                         type_params: vec![],
+                        surface_spans: vec![],
+                        implementation_spans: vec![],
                         modifiers: FunctionModifiers {
                             is_async: false,
                             is_generator: false,

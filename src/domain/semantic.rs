@@ -281,6 +281,15 @@ pub struct FunctionDetails {
     /// - For unbounded generics, `bounds` is empty vec
     pub type_params: Vec<TypeParam>,
 
+    /// Source ranges forming the callable contract. Extractors should include
+    /// signatures, contract-relevant decorators, and source documentation.
+    #[serde(default)]
+    pub surface_spans: Vec<SourceSpan>,
+
+    /// Source ranges containing behavior beyond the callable contract.
+    #[serde(default)]
+    pub implementation_spans: Vec<SourceSpan>,
+
     /// Function modifiers and attributes
     pub modifiers: FunctionModifiers,
 }

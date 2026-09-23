@@ -1,12 +1,34 @@
 use crate::domain::edge::EdgeKind;
 use crate::domain::graph::ContextGraph;
-use crate::domain::node::{Node, NodeId};
+use crate::domain::node::{ContextFragment, ContextFragmentId, Mutability, Node, NodeId};
 use crate::domain::policy::{
-    PruningDecision, PruningParams, evaluate_forward, should_explore_callers,
+    BoundaryDecision, BoundaryPolicy, PruningDecision, PruningParams, ReasoningMode,
+    ReasoningRelation, SyntacticBoundaryPolicy, evaluate_forward, should_explore_callers,
 };
 use petgraph::graph::NodeIndex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Direction {
+    In,
+    Out,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReasoningState {
+    pub node_index: NodeIndex,
+    pub direction: Direction,
+    pub reasoning_mode: ReasoningMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundaryStop {
+    pub source: NodeId,
+    pub target: NodeId,
+    pub direction: Direction,
+    pub relation: ReasoningRelation,
+}
 
 /// How the current node was reached (for edge-aware pruning and reverse exploration).
 #[derive(Debug, Clone)]
@@ -36,6 +58,34 @@ pub struct CfResult {
     /// Traversal steps in BFS order: for each node, the edge kind and decision that led to it (None for start nodes).
     pub traversal_steps: Vec<TraversalStep>,
     pub total_context_size: u32,
+    pub cf_total: u32,
+    pub cf_out: u32,
+    pub cf_in: u32,
+    pub cf_overlap: u32,
+    pub out_fragments: Vec<ContextFragmentId>,
+    pub in_fragments: Vec<ContextFragmentId>,
+    pub boundary_stops: Vec<BoundaryStop>,
+    pub unresolved_states: Vec<ReasoningState>,
+    pub truncated: bool,
+    pub boundary_policy_id: String,
+    pub size_function_id: String,
+    pub measurement_scope_id: String,
+    pub graph_total_references: usize,
+    pub graph_unresolved_calls: usize,
+    pub graph_total_functions: usize,
+    pub graph_functions_with_explicit_fragments: usize,
+}
+
+#[derive(Debug, Default)]
+struct DirectionalTraversal {
+    fragments: HashMap<ContextFragmentId, u32>,
+    prepaid_fragments: HashMap<ContextFragmentId, u32>,
+    visited_states: HashSet<ReasoningState>,
+    nodes: Vec<NodeIndex>,
+    seen_nodes: HashSet<NodeIndex>,
+    boundary_stops: Vec<BoundaryStop>,
+    unresolved_states: Vec<ReasoningState>,
+    truncated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -65,10 +115,6 @@ pub struct ReachabilityResult {
 #[derive(Debug, Clone)]
 struct TraversalState {
     visited: HashSet<NodeIndex>,
-    ordered: Vec<NodeIndex>,
-    layers: Vec<Vec<NodeIndex>>,
-    traversal_steps: Vec<TraversalStep>,
-    total_context_size: u32,
     predecessors: HashMap<NodeIndex, NodeIndex>,
 }
 
@@ -78,35 +124,413 @@ struct TraversalState {
 pub struct CfSolver {
     graph: Arc<ContextGraph>,
     params: PruningParams,
+    boundary_policy: Arc<dyn BoundaryPolicy>,
 }
 
 impl CfSolver {
     pub fn new(graph: Arc<ContextGraph>, params: PruningParams) -> Self {
-        Self { graph, params }
+        let boundary_policy = Arc::new(SyntacticBoundaryPolicy::new(params.clone()));
+        Self {
+            graph,
+            params,
+            boundary_policy,
+        }
+    }
+
+    pub fn with_policy(
+        graph: Arc<ContextGraph>,
+        params: PruningParams,
+        boundary_policy: Arc<dyn BoundaryPolicy>,
+    ) -> Self {
+        Self {
+            graph,
+            params,
+            boundary_policy,
+        }
     }
 
     /// Compute CF for a given set of starting nodes (full result with layers, etc.).
     pub fn compute_cf(&self, starts: &[NodeIndex], max_tokens: Option<u32>) -> CfResult {
         let graph = self.graph.as_ref();
-        let traversal = self.traverse(starts, max_tokens);
+        let out = self.traverse_reasoning(starts, Direction::Out, max_tokens, &HashMap::new());
+        let incoming = self.traverse_reasoning(starts, Direction::In, max_tokens, &out.fragments);
+
+        let mut ordered_indices = out.nodes.clone();
+        let mut seen: HashSet<NodeIndex> = ordered_indices.iter().copied().collect();
+        for index in &incoming.nodes {
+            if seen.insert(*index) {
+                ordered_indices.push(*index);
+            }
+        }
+
+        let out_ids: HashSet<_> = out.fragments.keys().cloned().collect();
+        let in_ids: HashSet<_> = incoming.fragments.keys().cloned().collect();
+        let mut all_ids = out_ids.clone();
+        all_ids.extend(in_ids.iter().cloned());
+
+        let fragment_size = |id: &ContextFragmentId| {
+            out.fragments
+                .get(id)
+                .or_else(|| incoming.fragments.get(id))
+                .copied()
+                .unwrap_or(0)
+        };
+        let cf_out = out.fragments.values().copied().sum();
+        let cf_in = incoming.fragments.values().copied().sum();
+        let cf_total = all_ids.iter().map(fragment_size).sum();
+        let cf_overlap = out_ids.intersection(&in_ids).map(fragment_size).sum();
+
+        let reachable_set = ordered_indices
+            .iter()
+            .map(|idx| graph.node(*idx).core().id)
+            .collect();
+        let reachable_nodes_ordered: Vec<_> = ordered_indices
+            .iter()
+            .map(|idx| graph.node(*idx).core().id)
+            .collect();
+        let traversal_steps = reachable_nodes_ordered
+            .iter()
+            .map(|node_id| TraversalStep {
+                node_id: *node_id,
+                incoming_edge_kind: None,
+                decision: None,
+            })
+            .collect();
+        let mut boundary_stops = out.boundary_stops;
+        boundary_stops.extend(incoming.boundary_stops);
+        let mut unresolved_states = out.unresolved_states;
+        unresolved_states.extend(incoming.unresolved_states);
+
         CfResult {
-            reachable_set: traversal
-                .visited
-                .iter()
-                .map(|idx| graph.node(*idx).core().id)
-                .collect(),
-            reachable_nodes_ordered: traversal
-                .ordered
-                .iter()
-                .map(|idx| graph.node(*idx).core().id)
-                .collect(),
-            reachable_nodes_by_layer: traversal
-                .layers
-                .iter()
-                .map(|layer| layer.iter().map(|idx| graph.node(*idx).core().id).collect())
-                .collect(),
-            traversal_steps: traversal.traversal_steps,
-            total_context_size: traversal.total_context_size,
+            reachable_set,
+            reachable_nodes_ordered: reachable_nodes_ordered.clone(),
+            // Reasoning traversal is a graph of modes rather than a single BFS tree.
+            // Keep the compatibility field as one complete layer; fragment sets and
+            // boundary stops are the authoritative explanation.
+            reachable_nodes_by_layer: vec![reachable_nodes_ordered],
+            traversal_steps,
+            total_context_size: cf_total,
+            cf_total,
+            cf_out,
+            cf_in,
+            cf_overlap,
+            out_fragments: sorted_fragment_ids(out_ids),
+            in_fragments: sorted_fragment_ids(in_ids),
+            boundary_stops,
+            unresolved_states,
+            truncated: out.truncated || incoming.truncated,
+            boundary_policy_id: self.boundary_policy.id(),
+            size_function_id: graph.size_function_id.clone(),
+            measurement_scope_id: graph.measurement_scope_id.clone(),
+            graph_total_references: graph.coverage.total_references,
+            graph_unresolved_calls: graph.coverage.unresolved_calls,
+            graph_total_functions: graph.coverage.total_functions,
+            graph_functions_with_explicit_fragments: graph
+                .coverage
+                .functions_with_explicit_fragments,
+        }
+    }
+
+    fn traverse_reasoning(
+        &self,
+        starts: &[NodeIndex],
+        direction: Direction,
+        max_tokens: Option<u32>,
+        prepaid_fragments: &HashMap<ContextFragmentId, u32>,
+    ) -> DirectionalTraversal {
+        let graph = self.graph.as_ref();
+        let mut result = DirectionalTraversal {
+            prepaid_fragments: prepaid_fragments.clone(),
+            ..DirectionalTraversal::default()
+        };
+        let mut queue = VecDeque::new();
+        let initial_mode = match direction {
+            Direction::Out => ReasoningMode::NeedBehavior,
+            Direction::In => ReasoningMode::NeedContractEvidence,
+        };
+        for &node_index in starts {
+            queue.push_back(ReasoningState {
+                node_index,
+                direction,
+                reasoning_mode: initial_mode,
+            });
+        }
+
+        while let Some(state) = queue.pop_front() {
+            if !result.visited_states.insert(state) {
+                continue;
+            }
+            let node = graph.node(state.node_index);
+            if result.seen_nodes.insert(state.node_index) {
+                result.nodes.push(state.node_index);
+            }
+            if !add_fragment_with_limit(
+                &mut result,
+                &node.core().surface_fragment,
+                max_tokens,
+                state,
+            ) {
+                result.unresolved_states.extend(queue);
+                return result;
+            }
+            for type_fragment in referenced_type_fragments(node, &graph.type_registry) {
+                if !add_fragment_with_limit(&mut result, type_fragment, max_tokens, state) {
+                    result.unresolved_states.extend(queue);
+                    return result;
+                }
+            }
+            if mode_requires_implementation(state.reasoning_mode)
+                && let Some(fragment) = &node.core().implementation_fragment
+                && !add_fragment_with_limit(&mut result, fragment, max_tokens, state)
+            {
+                result.unresolved_states.extend(queue);
+                return result;
+            }
+
+            if node.core().is_external {
+                continue;
+            }
+
+            match (state.direction, state.reasoning_mode) {
+                (Direction::Out, ReasoningMode::NeedBehavior) => {
+                    for (target_index, edge_kind) in graph.outgoing_edges(state.node_index) {
+                        let (relation, next_mode) = match edge_kind {
+                            EdgeKind::Call => {
+                                (ReasoningRelation::Call, ReasoningMode::NeedBehavior)
+                            }
+                            EdgeKind::Read => {
+                                (ReasoningRelation::Read, ReasoningMode::NeedValueProvenance)
+                            }
+                            EdgeKind::Write => {
+                                (ReasoningRelation::Write, ReasoningMode::NeedSurface)
+                            }
+                            EdgeKind::Annotates => {
+                                (ReasoningRelation::Annotates, ReasoningMode::NeedBehavior)
+                            }
+                            EdgeKind::OverriddenBy => (
+                                ReasoningRelation::DynamicDispatch,
+                                ReasoningMode::NeedBehavior,
+                            ),
+                        };
+                        self.enqueue_target(
+                            &mut result,
+                            &mut queue,
+                            state,
+                            target_index,
+                            relation,
+                            next_mode,
+                        );
+                    }
+                }
+                (Direction::Out, ReasoningMode::NeedValueProvenance) => {
+                    if let Node::Variable(variable) = node
+                        && variable.mutability == Mutability::Mutable
+                    {
+                        for (writer_index, _) in
+                            graph.incoming_edges(state.node_index, Some(EdgeKind::Write))
+                        {
+                            self.enqueue_target(
+                                &mut result,
+                                &mut queue,
+                                state,
+                                writer_index,
+                                ReasoningRelation::ValueProvenance,
+                                ReasoningMode::NeedBehavior,
+                            );
+                        }
+                    }
+                }
+                (Direction::In, ReasoningMode::NeedContractEvidence) => {
+                    let contract_is_leaky = !matches!(
+                        self.boundary_policy.evaluate_contract(
+                            ReasoningMode::NeedContractEvidence,
+                            node,
+                            &graph.type_registry,
+                        ),
+                        BoundaryDecision::StopAtSurface
+                    );
+                    if contract_is_leaky {
+                        self.enqueue_callers(&mut result, &mut queue, state);
+                        self.enqueue_override_obligations(&mut result, &mut queue, state);
+                        self.enqueue_state_readers(&mut result, &mut queue, state);
+                    } else {
+                        self.enqueue_parent_contracts(&mut result, &mut queue, state, false);
+                    }
+                }
+                (Direction::In, ReasoningMode::NeedUsageEvidence)
+                | (Direction::In, ReasoningMode::NeedParentUsage) => {
+                    let contract_is_leaky = !matches!(
+                        self.boundary_policy.evaluate_contract(
+                            ReasoningMode::NeedUsageEvidence,
+                            node,
+                            &graph.type_registry,
+                        ),
+                        BoundaryDecision::StopAtSurface
+                    );
+                    if contract_is_leaky {
+                        self.enqueue_callers(&mut result, &mut queue, state);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        result
+    }
+
+    fn enqueue_target(
+        &self,
+        result: &mut DirectionalTraversal,
+        queue: &mut VecDeque<ReasoningState>,
+        source_state: ReasoningState,
+        target_index: NodeIndex,
+        relation: ReasoningRelation,
+        enter_mode: ReasoningMode,
+    ) {
+        let graph = self.graph.as_ref();
+        let source = graph.node(source_state.node_index);
+        let target = graph.node(target_index);
+        let decision = self.boundary_policy.evaluate(
+            source_state.reasoning_mode,
+            relation,
+            source,
+            target,
+            &graph.type_registry,
+        );
+        let reasoning_mode = match decision {
+            BoundaryDecision::StopAtSurface => {
+                result.boundary_stops.push(BoundaryStop {
+                    source: source.core().id,
+                    target: target.core().id,
+                    direction: source_state.direction,
+                    relation,
+                });
+                if relation == ReasoningRelation::DynamicDispatch {
+                    return;
+                }
+                ReasoningMode::NeedSurface
+            }
+            BoundaryDecision::EnterImplementation | BoundaryDecision::Unknown => enter_mode,
+        };
+        queue.push_back(ReasoningState {
+            node_index: target_index,
+            direction: source_state.direction,
+            reasoning_mode,
+        });
+    }
+
+    fn enqueue_callers(
+        &self,
+        result: &mut DirectionalTraversal,
+        queue: &mut VecDeque<ReasoningState>,
+        state: ReasoningState,
+    ) {
+        for (caller_index, _) in self
+            .graph
+            .incoming_edges(state.node_index, Some(EdgeKind::Call))
+        {
+            self.enqueue_target(
+                result,
+                queue,
+                state,
+                caller_index,
+                ReasoningRelation::UsageEvidence,
+                ReasoningMode::NeedUsageEvidence,
+            );
+        }
+    }
+
+    fn enqueue_parent_contracts(
+        &self,
+        result: &mut DirectionalTraversal,
+        queue: &mut VecDeque<ReasoningState>,
+        state: ReasoningState,
+        continue_to_parent_usage: bool,
+    ) {
+        for (parent_index, _) in self
+            .graph
+            .incoming_edges(state.node_index, Some(EdgeKind::OverriddenBy))
+        {
+            self.enqueue_target(
+                result,
+                queue,
+                state,
+                parent_index,
+                ReasoningRelation::ParentContract,
+                if continue_to_parent_usage {
+                    ReasoningMode::NeedParentUsage
+                } else {
+                    ReasoningMode::NeedSurface
+                },
+            );
+            if continue_to_parent_usage {
+                queue.push_back(ReasoningState {
+                    node_index: parent_index,
+                    direction: Direction::In,
+                    reasoning_mode: ReasoningMode::NeedParentUsage,
+                });
+            }
+        }
+    }
+
+    fn enqueue_override_obligations(
+        &self,
+        result: &mut DirectionalTraversal,
+        queue: &mut VecDeque<ReasoningState>,
+        state: ReasoningState,
+    ) {
+        self.enqueue_parent_contracts(result, queue, state, true);
+        for (child_index, edge_kind) in self.graph.outgoing_edges(state.node_index) {
+            if matches!(edge_kind, EdgeKind::OverriddenBy) {
+                self.enqueue_target(
+                    result,
+                    queue,
+                    state,
+                    child_index,
+                    ReasoningRelation::ChildImplementationEvidence,
+                    ReasoningMode::NeedImplementation,
+                );
+            }
+        }
+    }
+
+    fn enqueue_state_readers(
+        &self,
+        result: &mut DirectionalTraversal,
+        queue: &mut VecDeque<ReasoningState>,
+        state: ReasoningState,
+    ) {
+        for (variable_index, edge_kind) in self.graph.outgoing_edges(state.node_index) {
+            if !matches!(edge_kind, EdgeKind::Write) {
+                continue;
+            }
+            let Node::Variable(variable) = self.graph.node(variable_index) else {
+                continue;
+            };
+            if variable.mutability != Mutability::Mutable {
+                continue;
+            }
+            self.enqueue_target(
+                result,
+                queue,
+                state,
+                variable_index,
+                ReasoningRelation::Write,
+                ReasoningMode::NeedSurface,
+            );
+            for (reader_index, _) in self
+                .graph
+                .incoming_edges(variable_index, Some(EdgeKind::Read))
+            {
+                self.enqueue_target(
+                    result,
+                    queue,
+                    state,
+                    reader_index,
+                    ReasoningRelation::ObservedBy,
+                    ReasoningMode::NeedImplementation,
+                );
+            }
         }
     }
 
@@ -154,95 +578,7 @@ impl CfSolver {
     /// Compute CF total context size for a single start node.
     /// Does not return traversal order / layers; ignores max_tokens.
     pub fn compute_cf_total(&self, start: NodeIndex) -> u32 {
-        let graph = self.graph.as_ref();
-        let params = &self.params;
-        let node_count = graph.graph.node_count();
-        let mut visited = vec![false; node_count];
-        let mut reachable: Vec<NodeIndex> = Vec::new();
-        let mut total_size: u32 = 0;
-
-        let mut queue: VecDeque<(NodeIndex, ReachedVia)> = VecDeque::new();
-
-        let add_node = |idx: NodeIndex,
-                        visited: &mut [bool],
-                        reachable: &mut Vec<NodeIndex>,
-                        total_size: &mut u32| {
-            let pos = idx.index();
-            if pos >= visited.len() {
-                return;
-            }
-            if !visited[pos] {
-                visited[pos] = true;
-                *total_size = total_size.saturating_add(graph.node(idx).core().context_size);
-                reachable.push(idx);
-            }
-        };
-
-        add_node(start, &mut visited, &mut reachable, &mut total_size);
-        queue.push_back((start, ReachedVia::Start));
-
-        while let Some((current, reached_via)) = queue.pop_front() {
-            // === Stop exploring from reverse traversal nodes ===
-            // If we reached this node just to understand how it calls something
-            // or mutates shared state, we only need its immediate context. We do not explore further from it.
-            if matches!(
-                reached_via,
-                ReachedVia::CallIn | ReachedVia::SharedStateWrite
-            ) {
-                continue;
-            }
-
-            let current_node = graph.node(current);
-
-            for (neighbor, edge_kind) in graph.outgoing_edges(current) {
-                let neighbor_pos = neighbor.index();
-                if neighbor_pos < visited.len() && visited[neighbor_pos] {
-                    continue;
-                }
-
-                let neighbor_node = graph.node(neighbor);
-                let decision =
-                    evaluate_forward(params, current_node, neighbor_node, edge_kind, graph);
-
-                if matches!(decision, PruningDecision::Transparent) {
-                    add_node(neighbor, &mut visited, &mut reachable, &mut total_size);
-                    queue.push_back((neighbor, ReachedVia::Forward(edge_kind.clone())));
-                } else {
-                    add_node(neighbor, &mut visited, &mut reachable, &mut total_size);
-                }
-            }
-
-            if let Node::Function(f) = current_node {
-                let incoming_edge = match &reached_via {
-                    ReachedVia::Forward(ek) => Some(ek),
-                    _ => None,
-                };
-                if should_explore_callers(f, current, incoming_edge, params, graph) {
-                    for (caller_idx, _) in graph.incoming_edges(current, Some(EdgeKind::Call)) {
-                        let caller_pos = caller_idx.index();
-                        if caller_pos < visited.len() && !visited[caller_pos] {
-                            add_node(caller_idx, &mut visited, &mut reachable, &mut total_size);
-                            queue.push_back((caller_idx, ReachedVia::CallIn));
-                        }
-                    }
-                }
-            }
-
-            if let Node::Variable(v) = current_node
-                && v.mutability == crate::domain::node::Mutability::Mutable
-                && matches!(reached_via, ReachedVia::Forward(EdgeKind::Read))
-            {
-                for (writer_idx, _) in graph.incoming_edges(current, Some(EdgeKind::Write)) {
-                    let writer_pos = writer_idx.index();
-                    if writer_pos < visited.len() && !visited[writer_pos] {
-                        add_node(writer_idx, &mut visited, &mut reachable, &mut total_size);
-                        queue.push_back((writer_idx, ReachedVia::SharedStateWrite));
-                    }
-                }
-            }
-        }
-
-        total_size
+        self.compute_cf(&[start], None).cf_total
     }
 
     fn traverse(&self, starts: &[NodeIndex], max_tokens: Option<u32>) -> TraversalState {
@@ -256,42 +592,22 @@ impl CfSolver {
 
         let start_set: HashSet<NodeIndex> = starts.iter().copied().collect();
         let mut visited = HashSet::new();
-        let mut ordered = Vec::new();
-        let mut traversal_steps = Vec::new();
-        let mut layers: Vec<Vec<NodeIndex>> = Vec::new();
         let mut predecessors = HashMap::new();
-        let mut queue: VecDeque<(NodeIndex, u32, ReachedVia, Option<PruningDecision>)> =
-            VecDeque::new();
+        let mut queue: VecDeque<(NodeIndex, ReachedVia)> = VecDeque::new();
         let mut total_size = 0;
 
         for &start in starts {
-            queue.push_back((start, 0, ReachedVia::Start, None));
+            queue.push_back((start, ReachedVia::Start));
         }
 
-        while let Some((current, depth, reached_via, incoming_decision)) = queue.pop_front() {
+        while let Some((current, reached_via)) = queue.pop_front() {
             let current_node = graph.node(current);
-            let current_id = current_node.core().id;
 
             if !visited.insert(current) {
                 continue;
             }
 
             total_size += current_node.core().context_size;
-            let step_edge_kind = match &reached_via {
-                ReachedVia::Forward(ek) => Some(ek.clone()),
-                _ => None,
-            };
-            ordered.push(current);
-            traversal_steps.push(TraversalStep {
-                node_id: current_id,
-                incoming_edge_kind: step_edge_kind,
-                decision: incoming_decision,
-            });
-
-            while layers.len() <= depth as usize {
-                layers.push(Vec::new());
-            }
-            layers[depth as usize].push(current);
 
             if let Some(limit) = max_tokens
                 && total_size >= limit
@@ -322,12 +638,7 @@ impl CfSolver {
                     if !start_set.contains(&neighbor) {
                         predecessors.entry(neighbor).or_insert(current);
                     }
-                    queue.push_back((
-                        neighbor,
-                        depth + 1,
-                        ReachedVia::Forward(edge_kind.clone()),
-                        Some(decision),
-                    ));
+                    queue.push_back((neighbor, ReachedVia::Forward(edge_kind.clone())));
                 } else if !visited.contains(&neighbor) {
                     let boundary_size = neighbor_node.core().context_size;
                     if let Some(limit) = max_tokens
@@ -341,18 +652,6 @@ impl CfSolver {
                     }
                     if visited.insert(neighbor) {
                         total_size += boundary_size;
-                        ordered.push(neighbor);
-                        traversal_steps.push(TraversalStep {
-                            node_id: neighbor_node.core().id,
-                            incoming_edge_kind: Some(edge_kind.clone()),
-                            decision: Some(decision),
-                        });
-
-                        let boundary_depth = depth + 1;
-                        while layers.len() <= boundary_depth as usize {
-                            layers.push(Vec::new());
-                        }
-                        layers[boundary_depth as usize].push(neighbor);
                     }
                 }
             }
@@ -377,7 +676,7 @@ impl CfSolver {
                             if !start_set.contains(&caller_idx) {
                                 predecessors.entry(caller_idx).or_insert(current);
                             }
-                            queue.push_back((caller_idx, depth + 1, ReachedVia::CallIn, None));
+                            queue.push_back((caller_idx, ReachedVia::CallIn));
                         }
                     }
                 }
@@ -401,12 +700,7 @@ impl CfSolver {
                         if !start_set.contains(&writer_idx) {
                             predecessors.entry(writer_idx).or_insert(current);
                         }
-                        queue.push_back((
-                            writer_idx,
-                            depth + 1,
-                            ReachedVia::SharedStateWrite,
-                            None,
-                        ));
+                        queue.push_back((writer_idx, ReachedVia::SharedStateWrite));
                     }
                 }
             }
@@ -420,10 +714,6 @@ impl CfSolver {
 
         TraversalState {
             visited,
-            ordered,
-            layers,
-            traversal_steps,
-            total_context_size: total_size,
             predecessors,
         }
     }
@@ -451,12 +741,92 @@ impl CfSolver {
     }
 }
 
+fn mode_requires_implementation(mode: ReasoningMode) -> bool {
+    matches!(
+        mode,
+        ReasoningMode::NeedBehavior
+            | ReasoningMode::NeedValueProvenance
+            | ReasoningMode::NeedUsageEvidence
+            | ReasoningMode::NeedContractEvidence
+            | ReasoningMode::NeedImplementation
+    )
+}
+
+fn add_fragment_with_limit(
+    traversal: &mut DirectionalTraversal,
+    fragment: &ContextFragment,
+    max_tokens: Option<u32>,
+    state: ReasoningState,
+) -> bool {
+    if traversal.fragments.contains_key(&fragment.id) {
+        return true;
+    }
+    let current: u32 = traversal
+        .prepaid_fragments
+        .values()
+        .copied()
+        .sum::<u32>()
+        .saturating_add(
+            traversal
+                .fragments
+                .iter()
+                .filter(|(id, _)| !traversal.prepaid_fragments.contains_key(*id))
+                .map(|(_, size)| *size)
+                .sum(),
+        );
+    if traversal.prepaid_fragments.contains_key(&fragment.id) {
+        traversal
+            .fragments
+            .insert(fragment.id.clone(), fragment.context_size);
+        return true;
+    }
+    if max_tokens.is_some_and(|limit| current.saturating_add(fragment.context_size) > limit) {
+        traversal.truncated = true;
+        traversal.unresolved_states.push(state);
+        return false;
+    }
+    traversal
+        .fragments
+        .insert(fragment.id.clone(), fragment.context_size);
+    true
+}
+
+fn sorted_fragment_ids(ids: HashSet<ContextFragmentId>) -> Vec<ContextFragmentId> {
+    let mut ids: Vec<_> = ids.into_iter().collect();
+    ids.sort();
+    ids
+}
+
+fn referenced_type_fragments<'a>(
+    node: &'a Node,
+    registry: &'a crate::domain::type_registry::TypeRegistry,
+) -> Vec<&'a ContextFragment> {
+    let type_ids: Vec<&str> = match node {
+        Node::Function(function) => function
+            .parameters
+            .iter()
+            .filter_map(|parameter| parameter.param_type.as_deref())
+            .chain(function.return_types.iter().map(String::as_str))
+            .collect(),
+        Node::Variable(variable) => variable.var_type.as_deref().into_iter().collect(),
+    };
+    let mut seen = HashSet::new();
+    type_ids
+        .into_iter()
+        .filter(|type_id| seen.insert(*type_id))
+        .filter_map(|type_id| registry.get(type_id))
+        .map(|type_info| &type_info.surface_fragment)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::edge::EdgeKind;
     use crate::domain::graph::ContextGraph;
-    use crate::domain::node::{FunctionNode, Node, NodeCore, SourceSpan, Visibility};
+    use crate::domain::node::{
+        ContextFragment, FunctionNode, Node, NodeCore, SourceSpan, Visibility,
+    };
     use crate::domain::policy::PruningParams;
     use std::sync::Arc;
 
@@ -512,6 +882,58 @@ mod tests {
             var_type: None,
             mutability,
             variable_kind: crate::domain::node::VariableKind::Global,
+        })
+    }
+
+    fn fragment_node(
+        id: u32,
+        name: &str,
+        surface_size: u32,
+        implementation_size: u32,
+        reliable_contract: bool,
+    ) -> Node {
+        let span = SourceSpan {
+            start_line: id,
+            start_column: 0,
+            end_line: id + 1,
+            end_column: 0,
+        };
+        let core = NodeCore::with_fragments(
+            id,
+            name.to_string(),
+            None,
+            ContextFragment::new(
+                format!("{name}:surface"),
+                Some(span.clone()),
+                None,
+                surface_size,
+            ),
+            Some(ContextFragment::new(
+                format!("{name}:implementation"),
+                Some(span.clone()),
+                None,
+                implementation_size,
+            )),
+            span,
+            if reliable_contract { 1.0 } else { 0.0 },
+            Vec::new(),
+            false,
+            "test.py".to_string(),
+        );
+        Node::Function(FunctionNode {
+            core,
+            parameters: Vec::new(),
+            is_async: false,
+            is_generator: false,
+            visibility: Visibility::Public,
+            return_types: if reliable_contract {
+                vec!["int".to_string()]
+            } else {
+                Vec::new()
+            },
+            is_interface_method: false,
+            is_constructor: false,
+            is_di_wired: false,
         })
     }
 
@@ -874,14 +1296,14 @@ mod tests {
         assert!(!result.reachable_set.contains(&4)); // E (not reachable)
         assert_eq!(result.total_context_size, 100);
 
-        // Verify layers
-        assert_eq!(result.reachable_nodes_by_layer[0].len(), 2); // {A, B}
+        // Mode-aware reasoning does not have a unique BFS depth, so the
+        // compatibility layer contains the complete reached-node union.
+        assert_eq!(result.reachable_nodes_by_layer.len(), 1);
+        assert_eq!(result.reachable_nodes_by_layer[0].len(), 4);
         assert!(result.reachable_nodes_by_layer[0].contains(&0));
         assert!(result.reachable_nodes_by_layer[0].contains(&1));
-        assert_eq!(result.reachable_nodes_by_layer[1].len(), 1); // {C}
-        assert_eq!(result.reachable_nodes_by_layer[1][0], 2);
-        assert_eq!(result.reachable_nodes_by_layer[2].len(), 1); // {D}
-        assert_eq!(result.reachable_nodes_by_layer[2][0], 3);
+        assert!(result.reachable_nodes_by_layer[0].contains(&2));
+        assert!(result.reachable_nodes_by_layer[0].contains(&3));
     }
 
     #[test]
@@ -928,5 +1350,158 @@ mod tests {
         let got = solver.compute_cf_total(a);
         assert_eq!(got, expected);
         assert_eq!(got, 10 + 20);
+    }
+
+    #[test]
+    fn reliable_callee_charges_surface_only() {
+        let mut graph = ContextGraph::new();
+        let target = graph.add_node("target".into(), fragment_node(0, "target", 2, 8, false));
+        let callee = graph.add_node("callee".into(), fragment_node(1, "callee", 3, 30, true));
+        graph.add_edge(target, callee, EdgeKind::Call);
+
+        let result = CfSolver::new(Arc::new(graph), PruningParams::academic(0.5))
+            .compute_cf(&[target], None);
+
+        assert_eq!(result.cf_out, 13);
+        assert_eq!(result.cf_in, 10);
+        assert_eq!(result.cf_overlap, 10);
+        assert_eq!(result.cf_total, 13);
+        assert!(result.out_fragments.contains(&"callee:surface".to_string()));
+        assert!(
+            !result
+                .out_fragments
+                .contains(&"callee:implementation".to_string())
+        );
+    }
+
+    #[test]
+    fn usage_mode_follows_caller_chain_without_callees() {
+        let mut graph = ContextGraph::new();
+        let target = graph.add_node("target".into(), fragment_node(0, "target", 1, 1, false));
+        let caller = graph.add_node("caller".into(), fragment_node(1, "caller", 2, 3, false));
+        let root = graph.add_node("root".into(), fragment_node(2, "root", 4, 5, false));
+        let unrelated = graph.add_node(
+            "unrelated".into(),
+            fragment_node(3, "unrelated", 6, 7, false),
+        );
+        graph.add_edge(caller, target, EdgeKind::Call);
+        graph.add_edge(root, caller, EdgeKind::Call);
+        graph.add_edge(caller, unrelated, EdgeKind::Call);
+
+        let result = CfSolver::new(Arc::new(graph), PruningParams::academic(0.5))
+            .compute_cf(&[target], None);
+
+        assert_eq!(result.cf_in, 16);
+        assert!(
+            result
+                .in_fragments
+                .contains(&"root:implementation".to_string())
+        );
+        assert!(
+            !result
+                .in_fragments
+                .contains(&"unrelated:surface".to_string())
+        );
+    }
+
+    #[test]
+    fn mutable_state_writer_continues_in_behavior_mode() {
+        let mut graph = ContextGraph::new();
+        let reader = graph.add_node("reader".into(), fragment_node(0, "reader", 1, 1, false));
+        let state = graph.add_node(
+            "state".into(),
+            test_var_node(1, "state", crate::domain::node::Mutability::Mutable),
+        );
+        let writer = graph.add_node("writer".into(), fragment_node(2, "writer", 2, 2, false));
+        let dependency = graph.add_node(
+            "dependency".into(),
+            fragment_node(3, "dependency", 3, 5, false),
+        );
+        graph.add_edge(reader, state, EdgeKind::Read);
+        graph.add_edge(writer, state, EdgeKind::Write);
+        graph.add_edge(writer, dependency, EdgeKind::Call);
+
+        let result = CfSolver::new(Arc::new(graph), PruningParams::academic(0.5))
+            .compute_cf(&[reader], None);
+
+        assert!(
+            result
+                .out_fragments
+                .contains(&"dependency:implementation".to_string())
+        );
+    }
+
+    #[test]
+    fn mutable_state_readers_are_writer_obligations() {
+        let mut graph = ContextGraph::new();
+        let writer = graph.add_node("writer".into(), fragment_node(0, "writer", 2, 2, false));
+        let state = graph.add_node(
+            "state".into(),
+            test_var_node(1, "state", crate::domain::node::Mutability::Mutable),
+        );
+        let reader = graph.add_node("reader".into(), fragment_node(2, "reader", 2, 3, false));
+        graph.add_edge(writer, state, EdgeKind::Write);
+        graph.add_edge(reader, state, EdgeKind::Read);
+
+        let result = CfSolver::new(Arc::new(graph), PruningParams::academic(0.5))
+            .compute_cf(&[writer], None);
+
+        assert!(
+            result
+                .in_fragments
+                .contains(&"reader:implementation".to_string())
+        );
+        assert_eq!(result.cf_total, 10);
+    }
+
+    #[test]
+    fn child_override_always_includes_parent_surface() {
+        let mut graph = ContextGraph::new();
+        let parent = graph.add_node("parent".into(), fragment_node(0, "parent", 3, 30, true));
+        let child = graph.add_node("child".into(), fragment_node(1, "child", 2, 2, false));
+        graph.add_edge(parent, child, EdgeKind::OverriddenBy);
+
+        let result =
+            CfSolver::new(Arc::new(graph), PruningParams::academic(0.5)).compute_cf(&[child], None);
+
+        assert!(result.in_fragments.contains(&"parent:surface".to_string()));
+        assert!(
+            !result
+                .in_fragments
+                .contains(&"parent:implementation".to_string())
+        );
+    }
+
+    #[test]
+    fn truncation_reports_lower_bound_and_unresolved_state() {
+        let mut graph = ContextGraph::new();
+        let target = graph.add_node("target".into(), fragment_node(0, "target", 2, 8, false));
+
+        let result = CfSolver::new(Arc::new(graph), PruningParams::academic(0.5))
+            .compute_cf(&[target], Some(5));
+
+        assert!(result.truncated);
+        assert_eq!(result.cf_total, 2);
+        assert!(!result.unresolved_states.is_empty());
+    }
+
+    #[test]
+    fn truncation_budget_is_shared_across_in_and_out() {
+        let mut graph = ContextGraph::new();
+        let target = graph.add_node("target".into(), fragment_node(0, "target", 1, 1, false));
+        let dependency = graph.add_node(
+            "dependency".into(),
+            fragment_node(1, "dependency", 1, 1, false),
+        );
+        let caller = graph.add_node("caller".into(), fragment_node(2, "caller", 1, 1, false));
+        graph.add_edge(target, dependency, EdgeKind::Call);
+        graph.add_edge(caller, target, EdgeKind::Call);
+
+        let result = CfSolver::new(Arc::new(graph), PruningParams::academic(0.5))
+            .compute_cf(&[target], Some(5));
+
+        assert!(result.truncated);
+        assert_eq!(result.cf_total, 5);
+        assert!(result.cf_total <= 5);
     }
 }

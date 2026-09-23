@@ -72,6 +72,8 @@ fn write_reachable_fixture() -> (TempDir, std::path::PathBuf) {
                         }],
                         return_types: vec!["int".to_string()],
                         type_params: vec![],
+                        surface_spans: vec![],
+                        implementation_spans: vec![],
                         modifiers: FunctionModifiers {
                             visibility: Visibility::Public,
                             ..Default::default()
@@ -101,6 +103,8 @@ fn write_reachable_fixture() -> (TempDir, std::path::PathBuf) {
                         parameters: vec![],
                         return_types: vec!["int".to_string()],
                         type_params: vec![],
+                        surface_spans: vec![],
+                        implementation_spans: vec![],
                         modifiers: FunctionModifiers {
                             visibility: Visibility::Public,
                             ..Default::default()

@@ -7,6 +7,14 @@ use std::collections::HashMap;
 /// Symbol identifier (globally unique symbol string)
 pub type SymbolId = String;
 
+#[derive(Debug, Clone, Default)]
+pub struct GraphCoverage {
+    pub total_references: usize,
+    pub unresolved_calls: usize,
+    pub total_functions: usize,
+    pub functions_with_explicit_fragments: usize,
+}
+
 /// Context Graph - the core data structure
 pub struct ContextGraph {
     /// The directed graph of nodes and edges
@@ -17,6 +25,10 @@ pub struct ContextGraph {
 
     /// Type registry - stores type definitions outside the graph
     pub type_registry: TypeRegistry,
+
+    pub coverage: GraphCoverage,
+    pub size_function_id: String,
+    pub measurement_scope_id: String,
 }
 
 impl Default for ContextGraph {
@@ -31,6 +43,9 @@ impl ContextGraph {
             graph: DiGraph::new(),
             symbol_to_node: HashMap::new(),
             type_registry: TypeRegistry::new(),
+            coverage: GraphCoverage::default(),
+            size_function_id: "unknown".to_string(),
+            measurement_scope_id: "repository-local".to_string(),
         }
     }
 

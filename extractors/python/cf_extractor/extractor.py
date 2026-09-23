@@ -54,7 +54,7 @@ def _span_from_node(node: ast.AST, source_lines: list[str]) -> SourceSpan:
     return SourceSpan(
         start_line=start_line,
         start_column=start_col,
-        end_line=end_lineno,
+        end_line=end_lineno - 1,
         end_column=end_col,
     )
 
@@ -65,6 +65,51 @@ def _location_from_node(node: ast.AST, file_path: str) -> SourceLocation:
         line=node.lineno - 1,
         column=getattr(node, "col_offset", 0) or 0,
     )
+
+
+def _function_fragment_spans(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    source_lines: list[str],
+) -> tuple[list[SourceSpan], list[SourceSpan]]:
+    """Split a function into contract surface and implementation source ranges."""
+    first_body = node.body[0] if node.body else None
+    signature_end_line = (
+        max(node.lineno - 1, first_body.lineno - 2)
+        if first_body is not None
+        else node.lineno - 1
+    )
+    signature_start_node: ast.AST = (
+        node.decorator_list[0] if node.decorator_list else node
+    )
+    signature_start_line = signature_start_node.lineno - 1
+    if first_body is not None and first_body.lineno == node.lineno:
+        signature_end_column = getattr(first_body, "col_offset", 0) or 0
+    else:
+        signature_end_column = (
+            len(source_lines[signature_end_line])
+            if 0 <= signature_end_line < len(source_lines)
+            else 0
+        )
+    surface_spans = [
+        SourceSpan(
+            start_line=signature_start_line,
+            start_column=getattr(signature_start_node, "col_offset", 0) or 0,
+            end_line=signature_end_line,
+            end_column=signature_end_column,
+        )
+    ]
+
+    body = list(node.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        surface_spans.append(_span_from_node(body.pop(0), source_lines))
+
+    implementation_spans = [_span_from_node(statement, source_lines) for statement in body]
+    return surface_spans, implementation_spans
 
 
 def _extract_doc_from_annotation(node: ast.expr) -> list[str]:
@@ -336,6 +381,9 @@ class DefinitionCollector(ast.NodeVisitor):
             visibility=_visibility_from_name(node.name),
         )
         span = _span_from_node(node, self.source_lines)
+        surface_spans, implementation_spans = _function_fragment_spans(
+            node, self.source_lines
+        )
         loc = _location_from_node(node, self.file_path)
         enclosing = self._class_stack[-1][1] if self._class_stack else None
         self.definitions.append(
@@ -353,6 +401,8 @@ class DefinitionCollector(ast.NodeVisitor):
                     parameters=params,
                     return_types=return_types,
                     type_params=[],
+                    surface_spans=surface_spans,
+                    implementation_spans=implementation_spans,
                     modifiers=modifiers,
                 ),
             )

@@ -1,8 +1,8 @@
 use crate::domain::edge::EdgeKind;
 use crate::domain::graph::ContextGraph;
 use crate::domain::node::{
-    FunctionNode, Mutability as NodeMutability, Node, NodeCore, SourceSpan, VariableKind,
-    VariableNode, Visibility as NodeVisibility,
+    ContextFragment, FunctionNode, Mutability as NodeMutability, Node, NodeCore, SourceSpan,
+    VariableKind, VariableNode, Visibility as NodeVisibility,
 };
 use crate::domain::policy::{DocumentationScorer, NodeInfo, NodeType, SizeFunction};
 use crate::domain::ports::SourceReader;
@@ -73,26 +73,12 @@ impl GraphBuilder {
                     false
                 };
 
-                // Use signature-only span for context_size when: abstract/interface method,
-                // or Annotated-style documented factory (use_signature_only_for_size).
-                let use_signature_only = is_interface_method
-                    || (def.kind == SymbolKind::Function
-                        && def
-                            .as_function()
-                            .is_some_and(|f| f.modifiers.use_signature_only_for_size));
-
-                // For interface methods and annotated-style factories, only compute context_size for signature (not implementation body)
-                let context_size = if use_signature_only {
-                    let signature_span = extract_signature_span(&def.span, &source_code);
-                    self.size_function
-                        .compute(&source_code, &signature_span, &doc_texts)
-                } else {
-                    self.size_function.compute(
-                        &source_code,
-                        &convert_span_for_size(&def.span),
-                        &doc_texts,
-                    )
-                };
+                let (surface_fragment, implementation_fragment) = create_context_fragments(
+                    def,
+                    &source_code,
+                    self.size_function.as_ref(),
+                    is_interface_method,
+                );
 
                 // Use all documentation entries for scoring (e.g. Annotated Doc() per parameter);
                 // joining so the heuristic can see parameter coverage across all entries.
@@ -120,7 +106,7 @@ impl GraphBuilder {
                 match def.kind {
                     SymbolKind::Type => {
                         // Register in TypeRegistry
-                        let type_info = create_type_info(def, context_size, doc_score);
+                        let type_info = create_type_info(def, surface_fragment, doc_score);
                         type_registry.register(def.symbol_id.clone(), type_info);
 
                         // Register implementor relationships for OverriddenBy edges
@@ -141,13 +127,15 @@ impl GraphBuilder {
                         // Create graph node
                         node_symbols.insert(def.symbol_id.clone());
 
-                        let core = NodeCore::new(
+                        let core = NodeCore::with_fragments(
                             node_id,
                             def.name.clone(),
                             def.enclosing_symbol.clone(),
-                            context_size,
+                            surface_fragment,
+                            implementation_fragment,
                             span,
                             doc_score,
+                            doc_texts,
                             def.is_external,
                             document.relative_path.clone(),
                         );
@@ -174,19 +162,33 @@ impl GraphBuilder {
             let doc_texts = def.documentation.clone();
 
             let signature = extract_signature(def);
-            let synthetic_source = build_external_signature_only(&signature, def);
+            let mut synthetic_source = build_external_signature_only(&signature, def);
+            if !doc_texts.is_empty() {
+                synthetic_source.push('\n');
+                synthetic_source.push_str(&doc_texts.join("\n\n"));
+            }
             let line_count = synthetic_source.lines().count().max(1) as u32;
+            let last_line_length = synthetic_source
+                .lines()
+                .last()
+                .map_or(0, |line| line.chars().count() as u32);
             let synthetic_span = crate::domain::node::SourceSpan {
                 start_line: 0,
                 start_column: 0,
                 end_line: line_count.saturating_sub(1),
-                end_column: 0,
+                end_column: last_line_length,
             };
 
             let raw_size = self
                 .size_function
                 .compute(&synthetic_source, &synthetic_span, &[]);
             let context_size = raw_size.min(EXTERNAL_SYMBOL_MAX_TOKENS);
+            let surface_fragment = ContextFragment::new(
+                format!("{}:surface", def.symbol_id),
+                None,
+                Some(synthetic_source.clone()),
+                context_size,
+            );
 
             let doc_text_combined = doc_texts.join("\n\n");
             let doc_text = if doc_text_combined.is_empty() {
@@ -212,19 +214,21 @@ impl GraphBuilder {
 
             match def.kind {
                 SymbolKind::Type => {
-                    let type_info = create_type_info(def, context_size, doc_score);
+                    let type_info = create_type_info(def, surface_fragment, doc_score);
                     type_registry.register(def.symbol_id.clone(), type_info);
                 }
                 SymbolKind::Function | SymbolKind::Variable => {
                     node_symbols.insert(def.symbol_id.clone());
 
-                    let core = NodeCore::new(
+                    let core = NodeCore::with_fragments(
                         node_id,
                         def.name.clone(),
                         def.enclosing_symbol.clone(),
-                        context_size,
+                        surface_fragment,
+                        None,
                         convert_span(&def.span),
                         doc_score,
+                        doc_texts,
                         true, // always external
                         def.location.file_path.clone(),
                     );
@@ -503,6 +507,27 @@ impl GraphBuilder {
             }
         }
 
+        graph.coverage.total_references = semantic_data
+            .documents
+            .iter()
+            .map(|document| document.references.len())
+            .sum();
+        graph.coverage.unresolved_calls = unresolved_calls.len();
+        graph.coverage.total_functions = semantic_data
+            .documents
+            .iter()
+            .flat_map(|document| &document.definitions)
+            .filter(|definition| definition.kind == SymbolKind::Function)
+            .count();
+        graph.coverage.functions_with_explicit_fragments = semantic_data
+            .documents
+            .iter()
+            .flat_map(|document| &document.definitions)
+            .filter_map(SymbolDefinition::as_function)
+            .filter(|function| !function.surface_spans.is_empty())
+            .count();
+        graph.size_function_id = self.size_function.id().to_string();
+        graph.measurement_scope_id = semantic_data.project_root.clone();
         graph.type_registry = type_registry;
         Ok(graph)
     }
@@ -722,8 +747,116 @@ fn convert_mutability(mutability: &Mutability) -> NodeMutability {
     }
 }
 
+fn create_context_fragments(
+    def: &SymbolDefinition,
+    source_code: &str,
+    size_function: &dyn SizeFunction,
+    is_interface_method: bool,
+) -> (ContextFragment, Option<ContextFragment>) {
+    let full_span = convert_span_for_size(&def.span);
+    let surface_id = format!("{}:surface", def.symbol_id);
+
+    if def.kind != SymbolKind::Function {
+        let surface_size = size_function.compute(source_code, &full_span, &[]);
+        return (
+            ContextFragment::new(
+                surface_id,
+                Some(convert_span(&def.span)),
+                None,
+                surface_size,
+            ),
+            None,
+        );
+    }
+
+    let use_signature_only = is_interface_method
+        || def
+            .as_function()
+            .is_some_and(|function| function.modifiers.use_signature_only_for_size);
+
+    if let Some(function) = def.as_function()
+        && !function.surface_spans.is_empty()
+    {
+        let surface_size = function
+            .surface_spans
+            .iter()
+            .map(|span| size_function.compute(source_code, &convert_span_for_size(span), &[]))
+            .sum();
+        let surface_span =
+            (function.surface_spans.len() == 1).then(|| convert_span(&function.surface_spans[0]));
+        let surface = ContextFragment::new(surface_id, surface_span, None, surface_size);
+        let implementation_size = function
+            .implementation_spans
+            .iter()
+            .map(|span| size_function.compute(source_code, &convert_span_for_size(span), &[]))
+            .sum();
+        let implementation = (!use_signature_only && !function.implementation_spans.is_empty())
+            .then(|| {
+                ContextFragment::new(
+                    format!("{}:implementation", def.symbol_id),
+                    (function.implementation_spans.len() == 1)
+                        .then(|| convert_span(&function.implementation_spans[0])),
+                    None,
+                    implementation_size,
+                )
+            });
+        return (surface, implementation);
+    }
+
+    let signature_span = extract_signature_span(&def.span, source_code);
+    let signature_size = size_function.compute(source_code, &signature_span, &[]);
+    let documentation = def.documentation.join("\n\n");
+    let documentation_size = compute_text_size(size_function, &documentation);
+    let surface_size = signature_size.saturating_add(documentation_size);
+    let surface = ContextFragment::new(
+        surface_id,
+        Some(signature_span),
+        (!documentation.is_empty()).then_some(documentation),
+        surface_size,
+    );
+
+    if use_signature_only {
+        return (surface, None);
+    }
+
+    // The implementation excludes the signature and documentation already charged
+    // by the surface fragment.
+    let logic_size = size_function.compute(source_code, &full_span, &def.documentation);
+    let implementation_size = logic_size.saturating_sub(signature_size);
+    let implementation = ContextFragment::new(
+        format!("{}:implementation", def.symbol_id),
+        Some(convert_span(&def.span)),
+        None,
+        implementation_size,
+    );
+    (surface, Some(implementation))
+}
+
+fn compute_text_size(size_function: &dyn SizeFunction, text: &str) -> u32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let lines: Vec<_> = text.lines().collect();
+    let end_line = lines.len().saturating_sub(1) as u32;
+    let end_column = lines.last().map_or(0, |line| line.chars().count() as u32);
+    size_function.compute(
+        text,
+        &SourceSpan {
+            start_line: 0,
+            start_column: 0,
+            end_line,
+            end_column,
+        },
+        &[],
+    )
+}
+
 /// Create TypeInfo for registering in TypeRegistry
-fn create_type_info(def: &SymbolDefinition, context_size: u32, doc_score: f32) -> TypeInfo {
+fn create_type_info(
+    def: &SymbolDefinition,
+    surface_fragment: ContextFragment,
+    doc_score: f32,
+) -> TypeInfo {
     let mut type_kind = TypeKind::Class;
     let mut is_abstract = false;
     let mut type_param_count = 0;
@@ -766,8 +899,10 @@ fn create_type_info(def: &SymbolDefinition, context_size: u32, doc_score: f32) -
             type_param_count,
             type_var_info,
         },
-        context_size,
+        context_size: surface_fragment.context_size,
+        surface_fragment,
         doc_score,
+        documentation: def.documentation.clone(),
     }
 }
 
@@ -852,7 +987,11 @@ mod tests {
     #[test]
     fn test_create_type_info_from_class() {
         let def = test_function_def("TestClass");
-        let info = create_type_info(&def, 100, 0.8);
+        let info = create_type_info(
+            &def,
+            ContextFragment::new("TestClass:surface".to_string(), None, None, 100),
+            0.8,
+        );
         assert_eq!(info.definition.type_kind, TypeKind::Class);
         assert!(!info.definition.is_abstract);
     }
@@ -872,5 +1011,51 @@ mod tests {
         // Should stop at the first line with colon
         assert_eq!(sig_span.start_line, 0);
         assert_eq!(sig_span.end_line, 0);
+    }
+
+    struct SpanSize;
+
+    impl SizeFunction for SpanSize {
+        fn compute(&self, _source: &str, span: &SourceSpan, _doc_texts: &[String]) -> u32 {
+            span.end_line.saturating_sub(span.start_line) + 1
+        }
+    }
+
+    #[test]
+    fn test_explicit_fragment_spans_drive_surface_and_implementation_costs() {
+        let mut def = test_function_def("test_func");
+        let SymbolDetails::Function(function) = &mut def.details else {
+            panic!("function fixture");
+        };
+        function.surface_spans = vec![
+            SemanticSpan {
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 10,
+            },
+            SemanticSpan {
+                start_line: 1,
+                start_column: 0,
+                end_line: 1,
+                end_column: 10,
+            },
+        ];
+        function.implementation_spans = vec![SemanticSpan {
+            start_line: 2,
+            start_column: 0,
+            end_line: 3,
+            end_column: 10,
+        }];
+
+        let (surface, implementation) = create_context_fragments(
+            &def,
+            "def f():\n    \"doc\"\n    return 1\n",
+            &SpanSize,
+            false,
+        );
+
+        assert_eq!(surface.context_size, 2);
+        assert_eq!(implementation.unwrap().context_size, 2);
     }
 }

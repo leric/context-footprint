@@ -29,7 +29,25 @@ pub struct ComputeRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ComputeResponse {
     pub starting_symbols: Vec<String>,
+    /// Compatibility alias for `cf_total`.
     pub total_context_size: u32,
+    pub cf_total: u32,
+    pub cf_out: u32,
+    pub cf_in: u32,
+    pub cf_overlap: u32,
+    pub out_fragments: Vec<String>,
+    pub in_fragments: Vec<String>,
+    pub truncated: bool,
+    pub unresolved_state_count: usize,
+    pub boundary_stop_count: usize,
+    pub boundary_stops: Vec<BoundaryStopDto>,
+    pub boundary_policy_id: String,
+    pub size_function_id: String,
+    pub measurement_scope_id: String,
+    pub graph_total_references: usize,
+    pub graph_unresolved_calls: usize,
+    pub graph_total_functions: usize,
+    pub graph_functions_with_explicit_fragments: usize,
     pub reachable_node_count: usize,
     pub reachable_nodes_by_layer: Vec<Vec<ReachableNode>>,
     pub reachable_nodes_ordered: Vec<ReachableNode>,
@@ -49,6 +67,14 @@ pub struct AnchorResolution {
     /// Reason the anchor could not be resolved, if applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unresolved_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BoundaryStopDto {
+    pub source_node_id: u32,
+    pub target_node_id: u32,
+    pub direction: String,
+    pub relation: String,
 }
 
 fn default_max_paths() -> usize {
@@ -181,7 +207,25 @@ pub struct TraversalStepDto {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ContextResponse {
     pub symbol: String,
+    /// Compatibility alias for `cf_total`.
     pub total_context_size: u32,
+    pub cf_total: u32,
+    pub cf_out: u32,
+    pub cf_in: u32,
+    pub cf_overlap: u32,
+    pub out_fragments: Vec<String>,
+    pub in_fragments: Vec<String>,
+    pub truncated: bool,
+    pub unresolved_state_count: usize,
+    pub boundary_stop_count: usize,
+    pub boundary_stops: Vec<BoundaryStopDto>,
+    pub boundary_policy_id: String,
+    pub size_function_id: String,
+    pub measurement_scope_id: String,
+    pub graph_total_references: usize,
+    pub graph_unresolved_calls: usize,
+    pub graph_total_functions: usize,
+    pub graph_functions_with_explicit_fragments: usize,
     pub reachable_node_count: usize,
     pub layers: Vec<ContextLayer>,
     /// Traversal steps in BFS order (only set when request had show_traversal).

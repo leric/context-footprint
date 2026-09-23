@@ -1,3 +1,9 @@
+> [!NOTE]
+> This document describes the pre-CF-in/CF-out implementation and is retained as
+> migration history. [`alg.md`](alg.md) is the normative algorithm specification;
+> [`algorithm-migration-analysis.md`](algorithm-migration-analysis.md) records the
+> differences and migration rationale.
+
 ## Architecture Overview
 
 CF 的实现分为三个独立模块，通过两个数据协议（Schema）隔离复杂度：

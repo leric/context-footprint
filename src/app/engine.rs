@@ -9,7 +9,7 @@ use crate::domain::node::{Node, NodeId};
 use crate::domain::policy::{PruningDecision, PruningParams};
 use crate::domain::ports::SourceReader;
 use crate::domain::semantic::SemanticData;
-use crate::domain::solver::{CfSolver, ReachabilityOptions};
+use crate::domain::solver::{BoundaryStop, CfSolver, ReachabilityOptions};
 use anyhow::{Context as _, Result, anyhow};
 use petgraph::graph::NodeIndex;
 use std::collections::{HashMap, HashSet};
@@ -183,6 +183,7 @@ impl ContextEngine {
 
         let solver = CfSolver::new(data.graph.clone(), pruning_params(req.policy));
         let result = solver.compute_cf(&starts, req.max_tokens);
+        let boundary_stops = boundary_stop_dtos(&result.boundary_stops);
 
         let reachable_nodes_ordered = result
             .reachable_nodes_ordered
@@ -204,6 +205,23 @@ impl ContextEngine {
         Ok(ComputeResponse {
             starting_symbols: effective_symbols,
             total_context_size: result.total_context_size,
+            cf_total: result.cf_total,
+            cf_out: result.cf_out,
+            cf_in: result.cf_in,
+            cf_overlap: result.cf_overlap,
+            out_fragments: result.out_fragments,
+            in_fragments: result.in_fragments,
+            truncated: result.truncated,
+            unresolved_state_count: result.unresolved_states.len(),
+            boundary_stop_count: result.boundary_stops.len(),
+            boundary_stops,
+            boundary_policy_id: result.boundary_policy_id,
+            size_function_id: result.size_function_id,
+            measurement_scope_id: result.measurement_scope_id,
+            graph_total_references: result.graph_total_references,
+            graph_unresolved_calls: result.graph_unresolved_calls,
+            graph_total_functions: result.graph_total_functions,
+            graph_functions_with_explicit_fragments: result.graph_functions_with_explicit_fragments,
             reachable_node_count: result.reachable_set.len(),
             reachable_nodes_by_layer,
             reachable_nodes_ordered,
@@ -448,6 +466,7 @@ impl ContextEngine {
 
         let solver = CfSolver::new(data.graph.clone(), pruning_params(req.policy));
         let result = solver.compute_cf(&[node_idx], req.max_tokens);
+        let boundary_stops = boundary_stop_dtos(&result.boundary_stops);
 
         let mut layers: Vec<ContextLayer> = Vec::new();
 
@@ -568,6 +587,23 @@ impl ContextEngine {
         Ok(ContextResponse {
             symbol: req.symbol,
             total_context_size: result.total_context_size,
+            cf_total: result.cf_total,
+            cf_out: result.cf_out,
+            cf_in: result.cf_in,
+            cf_overlap: result.cf_overlap,
+            out_fragments: result.out_fragments,
+            in_fragments: result.in_fragments,
+            truncated: result.truncated,
+            unresolved_state_count: result.unresolved_states.len(),
+            boundary_stop_count: result.boundary_stops.len(),
+            boundary_stops,
+            boundary_policy_id: result.boundary_policy_id,
+            size_function_id: result.size_function_id,
+            measurement_scope_id: result.measurement_scope_id,
+            graph_total_references: result.graph_total_references,
+            graph_unresolved_calls: result.graph_unresolved_calls,
+            graph_total_functions: result.graph_total_functions,
+            graph_functions_with_explicit_fragments: result.graph_functions_with_explicit_fragments,
             reachable_node_count: result.reachable_set.len(),
             layers,
             traversal_steps,
@@ -670,6 +706,18 @@ fn pruning_params(kind: PolicyKind) -> PruningParams {
         PolicyKind::Academic => PruningParams::academic(0.5),
         PolicyKind::Strict => PruningParams::strict(0.8),
     }
+}
+
+fn boundary_stop_dtos(stops: &[BoundaryStop]) -> Vec<BoundaryStopDto> {
+    stops
+        .iter()
+        .map(|stop| BoundaryStopDto {
+            source_node_id: stop.source,
+            target_node_id: stop.target,
+            direction: format!("{:?}", stop.direction),
+            relation: format!("{:?}", stop.relation),
+        })
+        .collect()
 }
 
 fn node_type_str(node: &Node) -> &'static str {
@@ -1046,7 +1094,14 @@ mod tests {
                     type_var_info: None,
                 },
                 context_size: 5,
+                surface_fragment: crate::domain::node::ContextFragment::new(
+                    "pkg/Plugin#:surface".to_string(),
+                    None,
+                    None,
+                    5,
+                ),
                 doc_score: 0.5,
+                documentation: Vec::new(),
             },
         );
 
@@ -1115,7 +1170,7 @@ mod tests {
 
         let i_run = g.add_node("pkg/Plugin#run().".into(), run);
         let i_render = g.add_node("pkg/Plugin#render().".into(), render);
-        let i_call = g.add_node("pkg/Plugin#__call__().".into(), call);
+        let _i_call = g.add_node("pkg/Plugin#__call__().".into(), call);
         let i_helper = g.add_node("pkg/Plugin#_helper().".into(), helper);
         let i_ext = g.add_node("lib/ext_func().".into(), ext_func);
 
@@ -1335,7 +1390,14 @@ mod tests {
                     type_var_info: None,
                 },
                 context_size: 5,
+                surface_fragment: crate::domain::node::ContextFragment::new(
+                    "pkg/MyClass#:surface".to_string(),
+                    None,
+                    None,
+                    5,
+                ),
                 doc_score: 0.5,
+                documentation: Vec::new(),
             },
         );
 

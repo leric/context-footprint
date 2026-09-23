@@ -96,6 +96,8 @@ fn build_payment_gateway_fixture(interface_doc_score: f32) -> SemanticData {
                         }],
                         return_types: vec!["bool#".to_string()],
                         type_params: vec![],
+                        surface_spans: vec![],
+                        implementation_spans: vec![],
                         modifiers: FunctionModifiers {
                             is_async: false,
                             is_generator: false,
@@ -171,6 +173,8 @@ fn build_payment_gateway_fixture(interface_doc_score: f32) -> SemanticData {
                         }],
                         return_types: vec!["bool#".to_string()],
                         type_params: vec![],
+                        surface_spans: vec![],
+                        implementation_spans: vec![],
                         modifiers: FunctionModifiers {
                             is_async: false,
                             is_generator: false,
@@ -244,6 +248,8 @@ fn build_payment_gateway_fixture(interface_doc_score: f32) -> SemanticData {
                         }],
                         return_types: vec!["bool#".to_string()],
                         type_params: vec![],
+                        surface_spans: vec![],
+                        implementation_spans: vec![],
                         modifiers: FunctionModifiers {
                             is_async: false,
                             is_generator: false,
@@ -286,6 +292,8 @@ fn build_payment_gateway_fixture(interface_doc_score: f32) -> SemanticData {
                         }],
                         return_types: vec!["bool#".to_string()],
                         type_params: vec![],
+                        surface_spans: vec![],
+                        implementation_spans: vec![],
                         modifiers: FunctionModifiers {
                             is_async: false,
                             is_generator: false,
@@ -322,6 +330,8 @@ fn build_payment_gateway_fixture(interface_doc_score: f32) -> SemanticData {
                         parameters: vec![],
                         return_types: vec!["bool#".to_string()],
                         type_params: vec![],
+                        surface_spans: vec![],
+                        implementation_spans: vec![],
                         modifiers: FunctionModifiers::default(),
                     }),
                 },
@@ -454,8 +464,8 @@ fn test_documented_interface_stops_at_boundary() {
         result.reachable_set.len()
     );
 
-    // Total should be process_order (10) + IPaymentGateway.charge (10) = 20
-    assert_eq!(result.total_context_size, 20);
+    // The boundary pays its signature and documentation surface, but not implementations.
+    assert_eq!(result.total_context_size, 30);
 }
 
 #[test]

@@ -38,6 +38,47 @@ from cf_extractor.schema import TypeDetails
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 
+def test_function_fragments_separate_surface_and_implementation(tmp_path: Path):
+    source = '''\
+@staticmethod
+def transform(
+    value: int,
+) -> int:
+    """Transform a value."""
+    return value + 1
+'''
+    (tmp_path / "sample.py").write_text(source, encoding="utf-8")
+
+    data = run_extract(str(tmp_path))
+    definition = next(
+        definition
+        for document in data.documents
+        for definition in document.definitions
+        if definition.name == "transform"
+    )
+    assert isinstance(definition.details, FunctionDetails)
+    assert len(definition.details.surface_spans) == 2
+    assert len(definition.details.implementation_spans) == 1
+    assert definition.details.surface_spans[0].start_line == 0
+
+
+def test_one_line_function_fragments_do_not_overlap(tmp_path: Path):
+    (tmp_path / "sample.py").write_text("def value() -> int: return 1\n", encoding="utf-8")
+
+    data = run_extract(str(tmp_path))
+    definition = next(
+        definition
+        for document in data.documents
+        for definition in document.definitions
+        if definition.name == "value"
+    )
+    assert isinstance(definition.details, FunctionDetails)
+    surface = definition.details.surface_spans[0]
+    implementation = definition.details.implementation_spans[0]
+    assert surface.end_line == implementation.start_line
+    assert surface.end_column <= implementation.start_column
+
+
 def test_find_python_files_include_pattern():
     """Include filter restricts to matching paths only."""
     files = find_python_files(str(FIXTURES_DIR), include_tests=True, include=["simple.py"])
