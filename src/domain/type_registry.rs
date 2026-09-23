@@ -3,6 +3,7 @@
 //! Types are no longer nodes in the graph. Instead, they are stored in a separate
 //! registry that can be queried during traversal for type-related information.
 
+use crate::domain::node::ContextFragment;
 use std::collections::HashMap;
 
 /// Type kind - language-agnostic classification for abstract types
@@ -51,8 +52,11 @@ pub struct TypeInfo {
     pub definition: TypeDefAttribute,
     /// Context size of the type definition (tokens needed to understand the type)
     pub context_size: u32,
+    /// Surface that must be loaded when the type participates in a contract.
+    pub surface_fragment: ContextFragment,
     /// Documentation score of the type
     pub doc_score: f32,
+    pub documentation: Vec<String>,
 }
 
 impl TypeInfo {
@@ -134,7 +138,14 @@ mod tests {
                 type_var_info: None,
             },
             context_size: 100,
+            surface_fragment: ContextFragment::new(
+                "type:test:surface".to_string(),
+                None,
+                None,
+                100,
+            ),
             doc_score: 0.8,
+            documentation: Vec::new(),
         }
     }
 

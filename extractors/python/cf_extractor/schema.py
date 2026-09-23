@@ -105,6 +105,8 @@ class FunctionDetails(BaseModel):
     parameters: list[Parameter] = PydanticField(default_factory=list)
     return_types: list[TypeRef] = PydanticField(default_factory=list)
     type_params: list[TypeParam] = PydanticField(default_factory=list)
+    surface_spans: list[SourceSpan] = PydanticField(default_factory=list)
+    implementation_spans: list[SourceSpan] = PydanticField(default_factory=list)
     modifiers: FunctionModifiers = PydanticField(default_factory=FunctionModifiers)
 
 

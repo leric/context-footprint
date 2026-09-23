@@ -104,6 +104,10 @@ impl SizeFunction for TiktokenSizeFunction {
         // Use a simple token counting approach (approximate)
         count_tokens_approx(&final_text)
     }
+
+    fn id(&self) -> &'static str {
+        "approx-tokenizer-v1"
+    }
 }
 
 fn count_tokens_approx(text: &str) -> u32 {

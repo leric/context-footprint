@@ -51,6 +51,8 @@ pub fn function_def(
             parameters,
             return_types,
             type_params: vec![],
+            surface_spans: vec![],
+            implementation_spans: vec![],
             modifiers: FunctionModifiers {
                 is_async: false,
                 is_generator: false,

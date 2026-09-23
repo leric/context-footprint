@@ -7,12 +7,40 @@ pub type NodeId = u32;
 pub type ScopeId = String;
 
 /// Source code span
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SourceSpan {
     pub start_line: u32,
     pub start_column: u32,
     pub end_line: u32,
     pub end_column: u32,
+}
+
+/// Stable identifier for a separately loadable piece of source context.
+pub type ContextFragmentId = String;
+
+/// A source fragment that is independently reached and charged by CF traversal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextFragment {
+    pub id: ContextFragmentId,
+    pub span: Option<SourceSpan>,
+    pub normalized_text: Option<String>,
+    pub context_size: u32,
+}
+
+impl ContextFragment {
+    pub fn new(
+        id: ContextFragmentId,
+        span: Option<SourceSpan>,
+        normalized_text: Option<String>,
+        context_size: u32,
+    ) -> Self {
+        Self {
+            id,
+            span,
+            normalized_text,
+            context_size,
+        }
+    }
 }
 
 /// Shared core attributes for all nodes
@@ -21,9 +49,13 @@ pub struct NodeCore {
     pub id: NodeId,
     pub name: String,
     pub scope: Option<ScopeId>,
+    /// Compatibility total. New CF computations charge the two fragments below.
     pub context_size: u32, // Abstract context size (computed by SizeFunction)
+    pub surface_fragment: ContextFragment,
+    pub implementation_fragment: Option<ContextFragment>,
     pub span: SourceSpan,
     pub doc_score: f32, // Documentation quality score [0.0, 1.0]
+    pub documentation: Vec<String>,
     pub is_external: bool,
     pub file_path: String, // Path to source file (relative to project root)
 }
@@ -40,13 +72,55 @@ impl NodeCore {
         is_external: bool,
         file_path: String,
     ) -> Self {
+        let surface_fragment = ContextFragment::new(
+            format!("node:{id}:surface"),
+            Some(span.clone()),
+            None,
+            context_size,
+        );
         Self {
             id,
             name,
             scope,
             context_size,
+            surface_fragment,
+            implementation_fragment: None,
             span,
             doc_score,
+            documentation: Vec::new(),
+            is_external,
+            file_path,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_fragments(
+        id: NodeId,
+        name: String,
+        scope: Option<ScopeId>,
+        surface_fragment: ContextFragment,
+        implementation_fragment: Option<ContextFragment>,
+        span: SourceSpan,
+        doc_score: f32,
+        documentation: Vec<String>,
+        is_external: bool,
+        file_path: String,
+    ) -> Self {
+        let context_size = surface_fragment.context_size.saturating_add(
+            implementation_fragment
+                .as_ref()
+                .map_or(0, |fragment| fragment.context_size),
+        );
+        Self {
+            id,
+            name,
+            scope,
+            context_size,
+            surface_fragment,
+            implementation_fragment,
+            span,
+            doc_score,
+            documentation,
             is_external,
             file_path,
         }

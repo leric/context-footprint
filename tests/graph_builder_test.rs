@@ -62,7 +62,14 @@ fn test_three_pass_creates_nodes_then_edges() {
     assert_eq!(graph.graph.node_count(), 2, "Pass 1: two nodes");
     assert!(graph.graph.edge_count() >= 1, "Pass 2/3: at least one edge");
     for node in graph.graph.node_weights() {
-        assert_eq!(node.core().context_size, 5, "SizeFunction applied");
+        let core = node.core();
+        let fragment_total = core.surface_fragment.context_size.saturating_add(
+            core.implementation_fragment
+                .as_ref()
+                .map_or(0, |fragment| fragment.context_size),
+        );
+        assert!(core.context_size >= 5, "SizeFunction applied");
+        assert_eq!(core.context_size, fragment_total);
     }
 }
 
@@ -219,10 +226,10 @@ fn test_use_signature_only_for_size_limits_context_size_to_signature() {
 
     let body_idx = graph.get_node_by_symbol("mod::Body").expect("Body symbol");
     let context_size = graph.node(body_idx).core().context_size;
-    // With use_signature_only_for_size, only the signature line (1 line) is counted: 10 tokens.
+    // Surface contains one signature line and one documentation fragment: 20 tokens.
     // If we had counted the full span (26 lines), it would be 260.
     assert_eq!(
-        context_size, 10,
-        "annotated-style factory should use signature-only size (1 line = 10), not full body (260)"
+        context_size, 20,
+        "annotated-style factory should charge signature + docs, not the full body"
     );
 }

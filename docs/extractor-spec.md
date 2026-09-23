@@ -81,6 +81,20 @@ AST forms differ by language, but the dependency meaning is the same.
   (`target_symbol=None`) and preserve partial information such as `method_name` and `receiver`
   when available.
 
+### Function Fragment Ranges
+
+Function definitions must populate two language-neutral range lists:
+
+- `surface_spans`: signature, contract-relevant decorators/modifiers, documentation, and
+  explicit error/effect declarations needed without entering the body;
+- `implementation_spans`: body ranges not already represented by the surface.
+
+Ranges must not overlap. Together they need not cover whitespace or comments that carry no
+contract or behavioral information. When an older extractor omits both lists, the Builder
+uses a compatibility fallback based on the full definition span and normalized signature
+metadata; this fallback is less precise and should be reported through the size-function
+provenance.
+
 ---
 
 ## Part 2: Cross-Language Correctness Invariants

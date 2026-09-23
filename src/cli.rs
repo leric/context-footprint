@@ -152,7 +152,13 @@ pub fn compute_cf_for_symbols(engine: &ContextEngine, symbols: &[String]) -> Res
 
     println!("\nCF Result:");
     println!("  Starting symbols: {}", result.starting_symbols.len());
-    println!("  Total context size: {} tokens", result.total_context_size);
+    println!("  CF total: {} tokens", result.cf_total);
+    println!("  CF out: {} tokens", result.cf_out);
+    println!("  CF in: {} tokens", result.cf_in);
+    println!("  CF overlap: {} tokens", result.cf_overlap);
+    if result.truncated {
+        println!("  Result is a lower bound (truncated)");
+    }
     println!("  Reachable nodes: {}", result.reachable_node_count);
 
     Ok(())
@@ -246,7 +252,14 @@ pub fn display_context_code(
         .count();
 
     println!("\nContext Summary:");
-    println!("  Total size: {} tokens", result.total_context_size);
+    println!("  CF total: {} tokens", result.cf_total);
+    println!(
+        "  CF out / in / overlap: {} / {} / {} tokens",
+        result.cf_out, result.cf_in, result.cf_overlap
+    );
+    if result.truncated {
+        println!("  Result is a lower bound (truncated)");
+    }
     println!(
         "  Reachable nodes: {} ({} total including 0-token stubs)",
         meaningful_node_count, result.reachable_node_count

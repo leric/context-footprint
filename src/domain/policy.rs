@@ -17,6 +17,61 @@ pub enum PruningDecision {
     Transparent, // Continue traversal through this node
 }
 
+/// Direction-specific reason for loading an artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReasoningMode {
+    NeedSurface,
+    NeedBehavior,
+    NeedValueProvenance,
+    NeedUsageEvidence,
+    NeedContractEvidence,
+    NeedImplementation,
+    NeedParentUsage,
+}
+
+/// A reasoning dependency derived from one or more program facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReasoningRelation {
+    Call,
+    Read,
+    Write,
+    Annotates,
+    DynamicDispatch,
+    ValueProvenance,
+    UsageEvidence,
+    ParentContract,
+    ChildImplementationEvidence,
+    ObservedBy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryDecision {
+    StopAtSurface,
+    EnterImplementation,
+    Unknown,
+}
+
+/// Evaluates boundary reliability independently from traversal semantics.
+pub trait BoundaryPolicy: Send + Sync {
+    fn evaluate(
+        &self,
+        reasoning_mode: ReasoningMode,
+        relation: ReasoningRelation,
+        source: &Node,
+        target: &Node,
+        type_registry: &TypeRegistry,
+    ) -> BoundaryDecision;
+
+    fn evaluate_contract(
+        &self,
+        reasoning_mode: ReasoningMode,
+        node: &Node,
+        type_registry: &TypeRegistry,
+    ) -> BoundaryDecision;
+
+    fn id(&self) -> String;
+}
+
 /// Pruning parameters for the CF solver.
 /// Only [doc_threshold] is configurable; "document completeness" is defined by doc_score (from doc_scorer).
 #[derive(Debug, Clone)]
@@ -49,6 +104,139 @@ impl PruningParams {
             doc_threshold,
             treat_typed_documented_function_as_boundary: false,
         }
+    }
+}
+
+/// Syntactic policy used by the existing Academic and Strict configurations.
+#[derive(Debug, Clone)]
+pub struct SyntacticBoundaryPolicy {
+    params: PruningParams,
+}
+
+impl SyntacticBoundaryPolicy {
+    pub fn new(params: PruningParams) -> Self {
+        Self { params }
+    }
+
+    pub fn params(&self) -> &PruningParams {
+        &self.params
+    }
+
+    fn evaluate_function(&self, target: &Node, type_registry: &TypeRegistry) -> BoundaryDecision {
+        let Node::Function(function) = target else {
+            return BoundaryDecision::Unknown;
+        };
+        let signature_complete = function.is_signature_complete_with_registry(type_registry);
+
+        if function.is_di_wired && signature_complete {
+            return BoundaryDecision::StopAtSurface;
+        }
+        if function.is_interface_method {
+            return if signature_complete && function.core.doc_score >= self.params.doc_threshold {
+                BoundaryDecision::StopAtSurface
+            } else {
+                BoundaryDecision::EnterImplementation
+            };
+        }
+        if is_abstract_factory(target, type_registry, self.params.doc_threshold) {
+            return BoundaryDecision::StopAtSurface;
+        }
+        if self.params.treat_typed_documented_function_as_boundary
+            && signature_complete
+            && function.core.doc_score >= self.params.doc_threshold
+        {
+            return BoundaryDecision::StopAtSurface;
+        }
+        BoundaryDecision::EnterImplementation
+    }
+}
+
+impl BoundaryPolicy for SyntacticBoundaryPolicy {
+    fn evaluate(
+        &self,
+        _reasoning_mode: ReasoningMode,
+        relation: ReasoningRelation,
+        source: &Node,
+        target: &Node,
+        type_registry: &TypeRegistry,
+    ) -> BoundaryDecision {
+        if target.core().is_external {
+            return BoundaryDecision::StopAtSurface;
+        }
+
+        match relation {
+            ReasoningRelation::UsageEvidence
+            | ReasoningRelation::ValueProvenance
+            | ReasoningRelation::ChildImplementationEvidence
+            | ReasoningRelation::ObservedBy => BoundaryDecision::EnterImplementation,
+            ReasoningRelation::ParentContract | ReasoningRelation::Write => {
+                BoundaryDecision::StopAtSurface
+            }
+            ReasoningRelation::DynamicDispatch => {
+                match self.evaluate_contract(
+                    ReasoningMode::NeedContractEvidence,
+                    source,
+                    type_registry,
+                ) {
+                    BoundaryDecision::StopAtSurface => BoundaryDecision::StopAtSurface,
+                    BoundaryDecision::EnterImplementation | BoundaryDecision::Unknown => {
+                        BoundaryDecision::EnterImplementation
+                    }
+                }
+            }
+            ReasoningRelation::Read => match target {
+                Node::Variable(variable) => match variable.mutability {
+                    crate::domain::node::Mutability::Const
+                    | crate::domain::node::Mutability::Immutable => BoundaryDecision::StopAtSurface,
+                    crate::domain::node::Mutability::Mutable => {
+                        BoundaryDecision::EnterImplementation
+                    }
+                },
+                Node::Function(_) => BoundaryDecision::Unknown,
+            },
+            ReasoningRelation::Call | ReasoningRelation::Annotates => {
+                self.evaluate_function(target, type_registry)
+            }
+        }
+    }
+
+    fn evaluate_contract(
+        &self,
+        _reasoning_mode: ReasoningMode,
+        node: &Node,
+        type_registry: &TypeRegistry,
+    ) -> BoundaryDecision {
+        if node.core().is_external {
+            return BoundaryDecision::StopAtSurface;
+        }
+        match node {
+            Node::Variable(variable) => match variable.mutability {
+                crate::domain::node::Mutability::Const
+                | crate::domain::node::Mutability::Immutable => BoundaryDecision::StopAtSurface,
+                crate::domain::node::Mutability::Mutable => BoundaryDecision::EnterImplementation,
+            },
+            Node::Function(function) => {
+                let signature_complete =
+                    function.is_signature_complete_with_registry(type_registry);
+                if signature_complete
+                    && (function.is_di_wired
+                        || function.core.doc_score >= self.params.doc_threshold)
+                {
+                    BoundaryDecision::StopAtSurface
+                } else {
+                    BoundaryDecision::EnterImplementation
+                }
+            }
+        }
+    }
+
+    fn id(&self) -> String {
+        let mode = if self.params.treat_typed_documented_function_as_boundary {
+            "academic"
+        } else {
+            "strict"
+        };
+        format!("syntactic:{mode}:doc={:.3}", self.params.doc_threshold)
     }
 }
 
@@ -268,6 +456,10 @@ pub trait SizeFunction: Send + Sync {
     /// Compute the context size for a given source code span,
     /// potentially excluding documentation to avoid "punishing" well-documented code.
     fn compute(&self, source: &str, span: &SourceSpan, doc_texts: &[String]) -> u32;
+
+    fn id(&self) -> &'static str {
+        "custom"
+    }
 }
 
 /// Documentation scorer trait - evaluates documentation quality
@@ -538,7 +730,14 @@ mod tests {
                     type_var_info,
                 },
                 context_size: 0,
+                surface_fragment: crate::domain::node::ContextFragment::new(
+                    format!("{type_id}:surface"),
+                    None,
+                    None,
+                    0,
+                ),
                 doc_score: 0.0,
+                documentation: Vec::new(),
             },
         );
     }

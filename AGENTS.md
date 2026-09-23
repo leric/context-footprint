@@ -38,21 +38,23 @@ Domain Layer (src/domain/)     Adapters Layer (src/adapters/)
 
 ---
 
-### ADR-003: Pruning Logic Fully in Domain
+### ADR-005: Traversal in Domain, Boundary Evaluation Behind a Port
 
-**Decision**: Pruning logic lives entirely in domain; no policy trait. Only `doc_threshold` and a mode flag are configurable.
+**Decision**: Reasoning traversal remains entirely in domain. Boundary reliability is
+evaluated through the domain `BoundaryPolicy` port so heuristics can vary without
+redefining CF. ADR-005 supersedes ADR-003.
 
 **Rationale**:
-- "Good abstraction" rules (external → boundary, variable → transparent, abstract factory, sig+doc) are core algorithm
-- `doc_threshold` (with doc_scorer supplying `doc_score`) gives enough flexibility
-- CfSolver takes `PruningParams { doc_threshold, treat_typed_documented_function_as_boundary }`; engine maps `PolicyKind` → params
+- CF-in / CF-out relation derivation and traversal modes are core algorithm
+- Contract reliability is a heuristic and must remain independently identifiable
+- Results record the boundary policy ID for reproducible comparisons
 
-**Domain layer** (`src/domain/policy.rs`):
-- `PruningParams`: doc_threshold + treat_typed_documented_function_as_boundary (Academic vs Strict)
-- `evaluate(params, source, target, edge_kind, graph)`: full pruning algorithm
-- `is_abstract_factory()`: abstract-factory detection (always boundary)
+**Domain layer**:
+- `solver.rs`: fixed reasoning traversal and fragment accounting
+- `policy.rs`: `BoundaryPolicy`, decisions, and `SyntacticBoundaryPolicy`
+- `PruningParams`: backward-compatible Academic / Strict syntactic policy parameters
 
-**No adapters** for policy; engine uses `PruningParams::academic(0.5)` or `PruningParams::strict(0.8)` from `PolicyKind`.
+See [`docs/adr-005-reasoning-boundary-policy.md`](docs/adr-005-reasoning-boundary-policy.md).
 
 ---
 
